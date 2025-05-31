@@ -1,239 +1,363 @@
-#!/usr/bin/env python3
+ #!/usr/bin/env python3
 """
-CSE Communication System - IdP (Identity Provider) Component
-負責管理用戶身份、註冊和驗證
+Common utilities for CSE Communication System
+包含加密、JWT、網路通訊等共用功能
 """
 
-import sys
 import json
+import base64
+import logging
+import socket
 import threading
 import time
-from datetime import datetime
-from common_utils import *
+from datetime import datetime, timedelta
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+import jwt
+import os
+import struct
 
-class CSEIdP:
-    def __init__(self, passphrase):
-        self.passphrase = passphrase
-        self.logger = setup_logger('CSEIdP', 'idp.log')
-        self.registry = ServiceRegistry()
-        self.private_key, self.public_key = CryptoUtils.generate_rsa_keypair()
-        self.registered_clients = {}  # {client_id: {'password_hash': hash, 'registered_at': timestamp}}
-        self.client_lock = threading.Lock()
-        self.has_responded_to_server = False  # 新增標記
-        
-        self.logger.info("IdP initialized")
+# 設定日誌格式
+def setup_logger(name, log_file, level=logging.DEBUG):
+    """設定日誌記錄器"""
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     
-    def start(self):
-        """啟動IdP服務"""
-        # 啟動廣播監聽線程
-        listen_thread = threading.Thread(target=self._listen_for_broadcasts)
-        listen_thread.daemon = True
-        listen_thread.start()
-        
-        # 啟動TCP服務
-        self._start_tcp_service()
+    handler = logging.FileHandler(log_file)
+    handler.setFormatter(formatter)
     
-    def _listen_for_broadcasts(self):
-        """監聽服務廣播"""
-        def handle_broadcast(message, addr):
-            if message.get('type') == 'service_announcement' and message.get('role') == 'server':
-                # 響應Server的廣播
-                self._respond_to_server(addr, message)
-        
-        NetworkUtils.listen_broadcast(self.passphrase, handle_broadcast)
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    logger.addHandler(handler)
     
-    def _respond_to_server(self, server_addr, server_message):
-        """響應Server的廣播"""
-        # 如果已經響應過，就不再響應
-        if self.has_responded_to_server:
-            return
-        
-        # 等待一下確保Server的TCP服務已啟動
-        time.sleep(0.5)
-        
-        # 驗證並註冊Server
-        server_public_key = CryptoUtils.deserialize_public_key(server_message.get('public_key'))
-        self.registry.register_service('server', server_addr, server_public_key)
-        
-        # 發送響應
-        response = {
-            'type': 'service_response',
-            'role': 'idp',
-            'passphrase': self.passphrase,  # 明文通關密語驗證
-            'public_key': CryptoUtils.serialize_public_key(self.public_key)
-        }
-        
-        # 直接發送TCP響應給Server
-        try:
-            result = NetworkUtils.send_tcp_message(
-                server_addr,
-                server_message.get('port'),
-                response
-            )
-            if result and result.get('status') == 'success':
-                self.has_responded_to_server = True
-                self.logger.info(f"Successfully responded to server at {server_addr}")
-                
-                # 註冊其他服務（如果Server回傳了）
-                other_services = result.get('other_services', {})
-                for service_role, service_info in other_services.items():
-                    service_public_key = CryptoUtils.deserialize_public_key(service_info['public_key'])
-                    self.registry.register_service(service_role, service_info['address'], service_public_key)
-                    self.logger.info(f"Registered {service_role} service at {service_info['address']}")
-                    self.logger.info(f"Current registry state: {list(self.registry.services.keys())}")
-            else:
-                self.logger.error(f"Server response was not successful: {result}")
-        except Exception as e:
-            self.logger.error(f"Failed to respond to server: {e}")
+    # 同時輸出到控制台
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
     
-    def _start_tcp_service(self):
-        """啟動TCP服務"""
-        NetworkUtils.start_tcp_server(
-            NetworkUtils.SERVICE_PORTS['idp'],
-            self._handle_request
+    return logger
+
+class CryptoUtils:
+    """加密工具類"""
+    
+    @staticmethod
+    def generate_rsa_keypair():
+        """生成RSA密鑰對"""
+        private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048,
+            backend=default_backend()
+        )
+        public_key = private_key.public_key()
+        return private_key, public_key
+    
+    @staticmethod
+    def serialize_public_key(public_key):
+        """序列化公鑰"""
+        return public_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode('utf-8')
+    
+    @staticmethod
+    def deserialize_public_key(pem_data):
+        """反序列化公鑰"""
+        return serialization.load_pem_public_key(
+            pem_data.encode('utf-8'),
+            backend=default_backend()
         )
     
-    def _handle_request(self, request, client_addr):
-        """處理請求"""
-        request_type = request.get('type')
+    @staticmethod
+    def encrypt_with_rsa(public_key, data):
+        """使用RSA公鑰加密"""
+        encrypted = public_key.encrypt(
+            data.encode('utf-8') if isinstance(data, str) else data,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
+            )
+        )
+        return base64.b64encode(encrypted).decode('utf-8')
+    
+    @staticmethod
+    def decrypt_with_rsa(private_key, encrypted_data):
+        """使用RSA私鑰解密"""
+        decrypted = private_key.decrypt(
+            base64.b64decode(encrypted_data),
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
+            )
+        )
+        return decrypted.decode('utf-8')
+    
+    @staticmethod
+    def generate_aes_key():
+        """生成AES密鑰"""
+        return os.urandom(32)  # 256-bit key
+    
+    @staticmethod
+    def encrypt_aes_gcm(key, plaintext, associated_data=None):
+        """使用AES-GCM加密"""
+        iv = os.urandom(12)  # 96-bit nonce for GCM
+        encryptor = Cipher(
+            algorithms.AES(key),
+            modes.GCM(iv),
+            backend=default_backend()
+        ).encryptor()
         
-        if request_type == 'register':
-            return self._handle_registration(request)
-        elif request_type == 'authenticate':
-            return self._handle_authentication(request)
-        elif request_type == 'verify_client':
-            return self._handle_verify_client(request)
-        elif request_type == 'verify_jwt':
-            return self._handle_verify_jwt(request)
-        elif request_type == 'update_services':
-            return self._handle_update_services(request)
+        if associated_data:
+            encryptor.authenticate_additional_data(associated_data)
+        
+        # 檢查輸入是否為字符串，如果是則編碼為 bytes
+        if isinstance(plaintext, str):
+            plaintext = plaintext.encode('utf-8')
+        
+        ciphertext = encryptor.update(plaintext)
+        encryptor.finalize()
+        
+        return {
+            'ciphertext': base64.b64encode(ciphertext).decode('utf-8'),
+            'iv': base64.b64encode(iv).decode('utf-8'),
+            'tag': base64.b64encode(encryptor.tag).decode('utf-8')
+        }
+    
+    @staticmethod
+    def decrypt_aes_gcm(key, encrypted_data, associated_data=None, decode_text=True):
+        """使用AES-GCM解密"""
+        iv = base64.b64decode(encrypted_data['iv'])
+        tag = base64.b64decode(encrypted_data['tag'])
+        ciphertext = base64.b64decode(encrypted_data['ciphertext'])
+        
+        decryptor = Cipher(
+            algorithms.AES(key),
+            modes.GCM(iv, tag),
+            backend=default_backend()
+        ).decryptor()
+        
+        if associated_data:
+            decryptor.authenticate_additional_data(associated_data)
+        
+        plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+        
+        # 新增參數控制是否要解碼為文字
+        if decode_text:
+            return plaintext.decode('utf-8')
         else:
-            return {'status': 'error', 'message': 'Unknown request type'}
+            return plaintext
     
-    def _handle_registration(self, request):
-        """處理客戶端註冊"""
-        client_id = request.get('client_id')
-        password = request.get('password')
+    @staticmethod
+    def derive_key_from_passphrase(passphrase, salt=None):
+        """從通關密語派生密鑰"""
+        if salt is None:
+            salt = b'cse_communication_salt'  # 固定salt用於廣播
         
-        if not client_id or not password:
-            return {'status': 'error', 'message': 'Missing client_id or password'}
-        
-        with self.client_lock:
-            if client_id in self.registered_clients:
-                return {'status': 'error', 'message': 'Client already registered'}
-            
-            # 儲存客戶端資訊（實際應用中應該使用更安全的密碼儲存方式）
-            password_hash = base64.b64encode(
-                CryptoUtils.derive_key_from_passphrase(password, salt=client_id.encode())
-            ).decode('utf-8')
-            
-            self.registered_clients[client_id] = {
-                'password_hash': password_hash,
-                'registered_at': datetime.utcnow().isoformat()
-            }
-        
-        # 創建3P_JWT
-        jwt_token = JWTUtils.create_3p_jwt(client_id, self.private_key)
-        
-        self.logger.info(f"Registered new client: {client_id}")
-        
-        return {
-            'status': 'success',
-            'message': 'Registration successful',
-            '3p_jwt': jwt_token
-        }
-    
-    def _handle_authentication(self, request):
-        """處理客戶端認證"""
-        client_id = request.get('client_id')
-        password = request.get('password')
-        
-        if not client_id or not password:
-            return {'status': 'error', 'message': 'Missing client_id or password'}
-        
-        with self.client_lock:
-            client_info = self.registered_clients.get(client_id)
-            if not client_info:
-                return {'status': 'error', 'message': 'Client not registered'}
-            
-            # 驗證密碼
-            password_hash = base64.b64encode(
-                CryptoUtils.derive_key_from_passphrase(password, salt=client_id.encode())
-            ).decode('utf-8')
-            
-            if password_hash != client_info['password_hash']:
-                return {'status': 'error', 'message': 'Invalid credentials'}
-        
-        # 創建新的3P_JWT
-        jwt_token = JWTUtils.create_3p_jwt(client_id, self.private_key)
-        
-        self.logger.info(f"Authenticated client: {client_id}")
-        
-        return {
-            'status': 'success',
-            'message': 'Authentication successful',
-            '3p_jwt': jwt_token
-        }
-    
-    def _handle_verify_client(self, request):
-        """驗證客戶端（供Server使用）"""
-        client_id = request.get('client_id')
-        jwt_token = request.get('3p_jwt')
-        
-        # 驗證JWT
-        payload = JWTUtils.verify_jwt(jwt_token, self.public_key)
-        
-        if not payload:
-            return {'status': 'error', 'message': 'Invalid JWT'}
-        
-        if payload.get('user_id') != client_id or payload.get('type') != '3P_JWT':
-            return {'status': 'error', 'message': 'JWT validation failed'}
-        
-        # 檢查客戶端是否註冊
-        with self.client_lock:
-            if client_id not in self.registered_clients:
-                return {'status': 'error', 'message': 'Client not registered'}
-        
-        return {'status': 'success', 'message': 'Client verified'}
-    
-    def _handle_verify_jwt(self, request):
-        """處理JWT驗證請求（供KACLS使用）"""
-        token = request.get('token')
-        token_type = request.get('token_type')
-        
-        if token_type == '3P_JWT':
-            payload = JWTUtils.verify_jwt(token, self.public_key)
-            if payload and payload.get('type') == '3P_JWT':
-                # 檢查用戶是否仍然註冊
-                with self.client_lock:
-                    if payload.get('user_id') in self.registered_clients:
-                        return {'status': 'success', 'valid': True, 'payload': payload}
-        
-        return {'status': 'success', 'valid': False}
-    def _handle_update_services(self, request):
-        """處理服務更新請求"""
-        services = request.get('services', {})
-        
-        for service_role, service_info in services.items():
-            service_public_key = CryptoUtils.deserialize_public_key(service_info['public_key'])
-            self.registry.register_service(service_role, service_info['address'], service_public_key)
-            self.logger.info(f"Updated {service_role} service at {service_info['address']}")
-        
-        return {'status': 'success', 'message': 'Services updated'}
-    
-def main():
-    if len(sys.argv) != 2:
-        print("Usage: python idp.py <passphrase>")
-        sys.exit(1)
-    
-    passphrase = sys.argv[1]
-    idp = CSEIdP(passphrase)
-    
-    try:
-        idp.start()
-    except KeyboardInterrupt:
-        print("\nIdP shutting down...")
-        sys.exit(0)
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100000,
+            backend=default_backend()
+        )
+        return kdf.derive(passphrase.encode('utf-8'))
 
-if __name__ == "__main__":
-    main()
+class NetworkUtils:
+    """網路通訊工具類"""
+    
+    BROADCAST_PORT = 5000
+    SERVICE_PORTS = {
+        'server': 5001,
+        'idp': 5002,
+        'kacls': 5003
+    }
+    
+    @staticmethod
+    def send_broadcast(message, passphrase, port=BROADCAST_PORT):
+        """發送廣播訊息"""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        
+        # 加密廣播訊息
+        key = CryptoUtils.derive_key_from_passphrase(passphrase)
+        encrypted_msg = CryptoUtils.encrypt_aes_gcm(key, json.dumps(message))
+        
+        broadcast_data = {
+            'encrypted': encrypted_msg,
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        
+        sock.sendto(json.dumps(broadcast_data).encode('utf-8'), ('<broadcast>', port))
+        sock.close()
+    
+    @staticmethod
+    def listen_broadcast(passphrase, callback, port=BROADCAST_PORT):
+        """監聽廣播訊息"""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(('', port))
+        
+        while True:
+            try:
+                data, addr = sock.recvfrom(4096)
+                broadcast_data = json.loads(data.decode('utf-8'))
+                
+                # 解密廣播訊息
+                key = CryptoUtils.derive_key_from_passphrase(passphrase)
+                try:
+                    decrypted_msg = CryptoUtils.decrypt_aes_gcm(key, broadcast_data['encrypted'])
+                    message = json.loads(decrypted_msg)
+                    callback(message, addr[0])
+                except Exception:
+                    # 解密失敗，忽略此訊息
+                    pass
+                    
+            except Exception as e:
+                logging.error(f"Error in broadcast listener: {e}")
+    
+    @staticmethod
+    def send_tcp_message(host, port, message):
+        """發送TCP訊息"""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.connect((host, port))
+            
+            # 發送訊息長度
+            msg_bytes = json.dumps(message).encode('utf-8')
+            msg_len = struct.pack('>I', len(msg_bytes))
+            sock.sendall(msg_len + msg_bytes)
+            
+            # 接收回應
+            response_len = struct.unpack('>I', sock.recv(4))[0]
+            response_data = b''
+            while len(response_data) < response_len:
+                packet = sock.recv(response_len - len(response_data))
+                if not packet:
+                    return None
+                response_data += packet
+            
+            return json.loads(response_data.decode('utf-8'))
+            
+        finally:
+            sock.close()
+    
+    @staticmethod
+    def start_tcp_server(port, handler):
+        """啟動TCP伺服器"""
+        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_sock.bind(('', port))
+        server_sock.listen(5)
+        
+        logging.info(f"TCP server started on port {port}")
+        
+        while True:
+            client_sock, addr = server_sock.accept()
+            thread = threading.Thread(target=NetworkUtils._handle_client, 
+                                    args=(client_sock, addr, handler))
+            thread.daemon = True
+            thread.start()
+    
+    @staticmethod
+    def _handle_client(client_sock, addr, handler):
+        """處理客戶端連接"""
+        try:
+            # 接收訊息長度
+            msg_len = struct.unpack('>I', client_sock.recv(4))[0]
+            
+            # 接收訊息
+            msg_data = b''
+            while len(msg_data) < msg_len:
+                packet = client_sock.recv(msg_len - len(msg_data))
+                if not packet:
+                    return
+                msg_data += packet
+            
+            message = json.loads(msg_data.decode('utf-8'))
+            
+            # 處理訊息
+            response = handler(message, addr[0])
+            
+            # 發送回應
+            response_bytes = json.dumps(response).encode('utf-8')
+            response_len = struct.pack('>I', len(response_bytes))
+            client_sock.sendall(response_len + response_bytes)
+            
+        except Exception as e:
+            logging.error(f"Error handling client {addr}: {e}")
+        finally:
+            client_sock.close()
+
+class JWTUtils:
+    """JWT工具類"""
+    
+    @staticmethod
+    def create_jwt(payload, private_key, algorithm='RS256'):
+        """創建JWT"""
+        return jwt.encode(payload, private_key, algorithm=algorithm)
+    
+    @staticmethod
+    def verify_jwt(token, public_key, algorithms=['RS256']):
+        """驗證JWT"""
+        try:
+            return jwt.decode(token, public_key, algorithms=algorithms)
+        except jwt.InvalidTokenError:
+            return None
+    
+    @staticmethod
+    def create_3p_jwt(user_id, private_key):
+        """創建3P_JWT"""
+        payload = {
+            'user_id': user_id,
+            'type': '3P_JWT',
+            'iat': datetime.utcnow(),
+            'exp': datetime.utcnow() + timedelta(hours=24)
+        }
+        return JWTUtils.create_jwt(payload, private_key)
+    
+    @staticmethod
+    def create_b_jwt(user_id, resource_id, permissions, private_key):
+        """創建B_JWT"""
+        payload = {
+            'user_id': user_id,
+            'resource_id': resource_id,
+            'permissions': permissions,
+            'type': 'B_JWT',
+            'iat': datetime.utcnow(),
+            'exp': datetime.utcnow() + timedelta(hours=1)
+        }
+        return JWTUtils.create_jwt(payload, private_key)
+
+class ServiceRegistry:
+    """服務註冊表"""
+    
+    def __init__(self):
+        self.services = {}
+        self.public_keys = {}
+        self.lock = threading.Lock()
+    
+    def register_service(self, role, address, public_key):
+        """註冊服務"""
+        with self.lock:
+            self.services[role] = address
+            self.public_keys[role] = public_key
+            logging.info(f"Registered {role} service at {address}")
+    
+    def get_service(self, role):
+        """獲取服務地址"""
+        with self.lock:
+            return self.services.get(role)
+    
+    def get_public_key(self, role):
+        """獲取服務公鑰"""
+        with self.lock:
+            return self.public_keys.get(role)
+    
+    def is_complete(self):
+        """檢查是否所有服務都已註冊"""
+        with self.lock:
+            required_roles = {'server', 'idp', 'kacls'}
+            return all(role in self.services for role in required_roles)

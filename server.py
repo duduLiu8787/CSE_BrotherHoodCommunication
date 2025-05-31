@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 CSE Communication System - Server Component
-負責轉送加密內容、驗證權限、管理在線成員
+負責轉送加密內容、驗證權限、管理在線成員、管理群組
 """
 
 import sys
@@ -19,8 +19,10 @@ class CSEServer:
         self.private_key, self.public_key = CryptoUtils.generate_rsa_keypair()
         self.online_clients = {}  # {client_id: {'address': addr, 'last_seen': timestamp}}
         self.messages = {}  # {message_id: {'from': sender, 'to': receiver, 'data': encrypted_data, 'w_dek': w_dek}}
+        self.groups = {}  # {group_id: {'name': name, 'members': [client_ids], 'created_by': client_id}}
         self.client_lock = threading.Lock()
         self.message_lock = threading.Lock()
+        self.group_lock = threading.Lock()
         self.is_broadcasting = True
         
         self.logger.info("Server initialized")
@@ -103,6 +105,8 @@ class CSEServer:
             return self._handle_client_registration(request, client_addr)
         elif request_type == 'send_message':
             return self._handle_send_message(request, client_addr)
+        elif request_type == 'send_group_message':
+            return self._handle_send_group_message(request, client_addr)
         elif request_type == 'get_message':
             return self._handle_get_message(request, client_addr)
         elif request_type == 'get_online_clients':
@@ -113,6 +117,10 @@ class CSEServer:
             return self._handle_verify_jwt(request)
         elif request_type == 'heartbeat':
             return self._handle_heartbeat(request, client_addr)
+        elif request_type == 'create_group':
+            return self._handle_create_group(request, client_addr)
+        elif request_type == 'get_my_groups':
+            return self._handle_get_my_groups(request)
         else:
             return {'status': 'error', 'message': 'Unknown request type'}
     
@@ -126,7 +134,7 @@ class CSEServer:
                 self.registry.register_service(role, client_addr, public_key)
                 self.logger.info(f"Registered {role} service from {client_addr}")
                 
-                # 回傳其他服務的資訊，讓服務之間可以互相連接
+                # 回傳其他服務的資訊
                 other_services = {}
                 if role == 'idp' and self.registry.get_service('kacls'):
                     other_services['kacls'] = {
@@ -148,7 +156,7 @@ class CSEServer:
         return {'status': 'error', 'message': 'Invalid service response'}
     
     def _handle_check_messages(self, request):
-        #檢查是否有新訊息
+        """檢查是否有新訊息"""
         client_id = request.get('client_id')
     
         with self.client_lock:
@@ -157,7 +165,7 @@ class CSEServer:
         
             pending_messages = self.online_clients[client_id].get('pending_messages', [])
         
-         # 清空待處理訊息列表
+            # 清空待處理訊息列表
             self.online_clients[client_id]['pending_messages'] = []
     
         return {
@@ -191,12 +199,141 @@ class CSEServer:
             with self.client_lock:
                 self.online_clients[client_id] = {
                     'address': client_addr,
-                    'last_seen': datetime.utcnow().isoformat()
+                    'last_seen': datetime.utcnow().isoformat(),
+                    'pending_messages': []
                 }
             self.logger.info(f"Client {client_id} registered from {client_addr}")
             return {'status': 'success', 'message': 'Client registered successfully'}
         else:
             return {'status': 'error', 'message': 'Client verification failed'}
+    
+    def _handle_create_group(self, request, client_addr):
+        """處理創建群組請求"""
+        client_id = request.get('client_id')
+        group_name = request.get('group_name')
+        members = request.get('members', [])
+        
+        # 驗證客戶端身份
+        if client_id not in self.online_clients:
+            return {'status': 'error', 'message': 'Client not registered'}
+        
+        # 確保創建者在成員列表中
+        if client_id not in members:
+            members.append(client_id)
+        
+        # 生成群組ID
+        group_id = f"group_{datetime.utcnow().timestamp()}_{client_id}"
+        
+        # 創建群組
+        with self.group_lock:
+            self.groups[group_id] = {
+                'name': group_name,
+                'members': members,
+                'created_by': client_id,
+                'created_at': datetime.utcnow().isoformat()
+            }
+        
+        self.logger.info(f"Group '{group_name}' (ID: {group_id}) created by {client_id}")
+        
+        return {
+            'status': 'success',
+            'group_id': group_id,
+            'message': 'Group created successfully'
+        }
+    
+    def _handle_get_my_groups(self, request):
+        """處理獲取我的群組請求"""
+        client_id = request.get('client_id')
+        
+        # 獲取客戶端所在的所有群組
+        my_groups = {}
+        with self.group_lock:
+            for group_id, group_info in self.groups.items():
+                if client_id in group_info['members']:
+                    my_groups[group_id] = {
+                        'name': group_info['name'],
+                        'members': group_info['members']
+                    }
+        
+        return {
+            'status': 'success',
+            'groups': my_groups
+        }
+    
+    def _handle_send_group_message(self, request, client_addr):
+        """處理發送群組訊息請求"""
+        sender_id = request.get('sender_id')
+        group_id = request.get('receiver_id')  # 這裡receiver_id實際上是group_id
+        encrypted_data = request.get('encrypted_data')
+        w_dek = request.get('w_dek')
+        
+        # 驗證發送者身份
+        if sender_id not in self.online_clients:
+            return {'status': 'error', 'message': 'Sender not registered'}
+        
+        # 檢查群組是否存在
+        with self.group_lock:
+            if group_id not in self.groups:
+                return {'status': 'error', 'message': 'Group not found'}
+            
+            group_info = self.groups[group_id]
+            
+            # 檢查發送者是否是群組成員
+            if sender_id not in group_info['members']:
+                return {'status': 'error', 'message': 'Sender not a member of this group'}
+            
+            # 為每個群組成員創建訊息
+            for member_id in group_info['members']:
+                if member_id == sender_id:  # 跳過發送者自己
+                    continue
+                
+                if member_id not in self.online_clients:  # 跳過離線成員
+                    continue
+                
+                # 生成訊息ID
+                message_id = f"group_{group_id}_{sender_id}_{member_id}_{datetime.utcnow().timestamp()}"
+                
+                # 創建B_JWT
+                b_jwt = JWTUtils.create_b_jwt(
+                    member_id,
+                    message_id,
+                    ['read'],
+                    self.private_key
+                )
+                
+                # 儲存訊息
+                with self.message_lock:
+                    self.messages[message_id] = {
+                        'from': sender_id,
+                        'to': member_id,
+                        'group_id': group_id,
+                        'group_name': group_info['name'],
+                        'data': encrypted_data,
+                        'w_dek': w_dek,
+                        'timestamp': datetime.utcnow().isoformat(),
+                        'read': False
+                    }
+                
+                # 將新訊息加入接收者的待處理列表
+                with self.client_lock:
+                    if 'pending_messages' not in self.online_clients[member_id]:
+                        self.online_clients[member_id]['pending_messages'] = []
+                    
+                    self.online_clients[member_id]['pending_messages'].append({
+                        'message_id': message_id,
+                        'from': sender_id,
+                        'group_id': group_id,
+                        'group_name': group_info['name'],
+                        'b_jwt': b_jwt,
+                        'timestamp': datetime.utcnow().isoformat()
+                    })
+                
+                self.logger.info(f"Group message {message_id} stored for {member_id}")
+        
+        return {
+            'status': 'success',
+            'message': 'Group message sent successfully'
+        }
     
     def _handle_send_message(self, request, client_addr):
         """處理發送訊息請求"""
@@ -216,7 +353,7 @@ class CSEServer:
         # 生成訊息ID
         message_id = f"{sender_id}_{receiver_id}_{datetime.utcnow().timestamp()}"
         
-        # 先創建B_JWT（移到前面）
+        # 先創建B_JWT
         b_jwt = JWTUtils.create_b_jwt(
             receiver_id,
             message_id,
@@ -243,7 +380,7 @@ class CSEServer:
             self.online_clients[receiver_id]['pending_messages'].append({
                 'message_id': message_id,
                 'from': sender_id,
-                'b_jwt': b_jwt,  # 現在 b_jwt 已經定義
+                'b_jwt': b_jwt,
                 'timestamp': datetime.utcnow().isoformat()
             })
         
@@ -254,6 +391,7 @@ class CSEServer:
             'message_id': message_id,
             'b_jwt': b_jwt
         }
+    
     def _handle_get_message(self, request, client_addr):
         """處理獲取訊息請求"""
         client_id = request.get('client_id')
@@ -278,7 +416,7 @@ class CSEServer:
             if message['to'] != client_id:
                 return {'status': 'error', 'message': 'Access denied'}
         
-        return {
+        response_data = {
             'status': 'success',
             'message': {
                 'from': message['from'],
@@ -287,6 +425,13 @@ class CSEServer:
                 'timestamp': message['timestamp']
             }
         }
+        
+        # 如果是群組訊息，加入群組資訊
+        if 'group_id' in message:
+            response_data['message']['group_id'] = message['group_id']
+            response_data['message']['group_name'] = message['group_name']
+        
+        return response_data
     
     def _handle_get_online_clients(self, request):
         """處理獲取在線客戶端列表請求"""

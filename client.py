@@ -20,9 +20,10 @@ class CSEClient:
         self.three_p_jwt = None
         self.is_authenticated = False
         self.heartbeat_thread = None
-        self.message_check_thread = None  # 新增
-        self.new_messages = []  # 新增：儲存新訊息
-        self.message_lock = threading.Lock()  # 新增：訊息鎖
+        self.message_check_thread = None
+        self.new_messages = []
+        self.message_lock = threading.Lock()
+        self.groups = {}  # 儲存已加入的群組
 
         # 服務端口
         self.server_port = NetworkUtils.SERVICE_PORTS['server']
@@ -66,6 +67,9 @@ class CSEClient:
             
             # 向Server註冊
             self._register_with_server()
+            
+            # 獲取已加入的群組
+            self._get_my_groups()
             
             # 啟動心跳線程
             self._start_heartbeat()
@@ -126,7 +130,45 @@ class CSEClient:
             self.logger.error(f"Failed to get online clients: {response.get('message')}")
             return []
     
-    def send_message(self, receiver_id, message, kacls_host):
+    def create_group(self, group_name, member_ids):
+        """創建群組"""
+        request = {
+            'type': 'create_group',
+            'client_id': self.client_id,
+            'group_name': group_name,
+            'members': member_ids
+        }
+        
+        response = NetworkUtils.send_tcp_message(self.server_host, self.server_port, request)
+        
+        if response.get('status') == 'success':
+            group_id = response.get('group_id')
+            self.groups[group_id] = {
+                'name': group_name,
+                'members': member_ids
+            }
+            self.logger.info(f"Group '{group_name}' created with ID: {group_id}")
+            return True, group_id
+        else:
+            self.logger.error(f"Failed to create group: {response.get('message')}")
+            return False, response.get('message')
+    
+    def _get_my_groups(self):
+        """獲取已加入的群組"""
+        request = {
+            'type': 'get_my_groups',
+            'client_id': self.client_id
+        }
+        
+        response = NetworkUtils.send_tcp_message(self.server_host, self.server_port, request)
+        
+        if response.get('status') == 'success':
+            self.groups = response.get('groups', {})
+            self.logger.info(f"Retrieved {len(self.groups)} groups")
+        else:
+            self.logger.error(f"Failed to get groups: {response.get('message')}")
+    
+    def send_message(self, receiver_id, message, kacls_host, is_group=False):
         """發送加密訊息"""
         # 生成DEK
         dek = CryptoUtils.generate_aes_key()
@@ -152,9 +194,9 @@ class CSEClient:
         
         # 發送加密訊息到Server
         send_request = {
-            'type': 'send_message',
+            'type': 'send_group_message' if is_group else 'send_message',
             'sender_id': self.client_id,
-            'receiver_id': receiver_id,
+            'receiver_id': receiver_id,  # 如果是群組，這裡是group_id
             'encrypted_data': encrypted_message,
             'w_dek': w_dek
         }
@@ -162,7 +204,8 @@ class CSEClient:
         send_response = NetworkUtils.send_tcp_message(self.server_host, self.server_port, send_request)
         
         if send_response.get('status') == 'success':
-            self.logger.info(f"Message sent to {receiver_id}")
+            target_type = "group" if is_group else "user"
+            self.logger.info(f"Message sent to {target_type} {receiver_id}")
             return True
         else:
             self.logger.error(f"Failed to send message: {send_response.get('message')}")
@@ -210,11 +253,14 @@ class CSEClient:
             return {
                 'from': message_data['from'],
                 'message': decrypted_message,
-                'timestamp': message_data['timestamp']
+                'timestamp': message_data['timestamp'],
+                'group_id': message_data.get('group_id'),
+                'group_name': message_data.get('group_name')
             }
         except Exception as e:
             self.logger.error(f"Failed to decrypt message: {e}")
             return None
+    
     def _start_message_checker(self):
         """啟動訊息檢查線程"""
         def check_messages():
@@ -240,8 +286,11 @@ class CSEClient:
                             
                             # 顯示新訊息通知
                             for msg_info in new_messages:
-                                print(f"\n🔔 New message from {msg_info['from']} (ID: {msg_info['message_id']})")
-                                print("Type '3' to read messages or continue with your selection.")
+                                if msg_info.get('group_name'):
+                                    print(f"\n🔔 New group message in '{msg_info['group_name']}' from {msg_info['from']} (ID: {msg_info['message_id']})")
+                                else:
+                                    print(f"\n🔔 New message from {msg_info['from']} (ID: {msg_info['message_id']})")
+                                print("Type '4' to read messages or continue with your selection.")
                     
                 except Exception as e:
                     self.logger.error(f"Message check failed: {e}")
@@ -265,7 +314,10 @@ class CSEClient:
         print(f"\n📬 You have {len(pending)} new message(s):")
         
         for msg_info in pending:
-            print(f"\n--- Message from {msg_info['from']} ---")
+            if msg_info.get('group_name'):
+                print(f"\n--- Group message in '{msg_info['group_name']}' from {msg_info['from']} ---")
+            else:
+                print(f"\n--- Message from {msg_info['from']} ---")
             print(f"Time: {msg_info['timestamp']}")
             
             # 自動接收並解密訊息
@@ -313,9 +365,12 @@ def main():
                 break
         else:
             print("\n1. List online clients")
-            print("2. Send message")
-            print("3. Read messages")
-            print("4. Logout")
+            print("2. Send direct message")
+            print("3. Send group message")
+            print("4. Read messages")
+            print("5. Create group")
+            print("6. List my groups")
+            print("7. Logout")
             choice = input("Choose an option: ").strip()
 
             if choice == '1':
@@ -329,8 +384,54 @@ def main():
                 else:
                     print("Failed to send message.")
             elif choice == '3':
-                client.read_pending_messages(kacls_host)
+                # 列出可用的群組
+                if not client.groups:
+                    print("You are not in any groups. Create a group first.")
+                else:
+                    print("\nYour groups:")
+                    for group_id, group_info in client.groups.items():
+                        print(f"  {group_id}: {group_info['name']} (members: {', '.join(group_info['members'])})")
+                    
+                    group_id = input("Enter group ID: ").strip()
+                    if group_id in client.groups:
+                        message = input("Enter message: ")
+                        if client.send_message(group_id, message, kacls_host, is_group=True):
+                            print("Group message sent successfully!")
+                        else:
+                            print("Failed to send group message.")
+                    else:
+                        print("Invalid group ID.")
             elif choice == '4':
+                client.read_pending_messages(kacls_host)
+            elif choice == '5':
+                group_name = input("Enter group name: ").strip()
+                members_input = input("Enter member IDs (comma-separated, you are included by default): ").strip()
+                
+                if members_input:
+                    member_ids = [m.strip() for m in members_input.split(',')]
+                else:
+                    member_ids = []
+                
+                # 確保自己在成員列表中
+                if client.client_id not in member_ids:
+                    member_ids.append(client.client_id)
+                
+                success, result = client.create_group(group_name, member_ids)
+                if success:
+                    print(f"Group '{group_name}' created successfully! Group ID: {result}")
+                else:
+                    print(f"Failed to create group: {result}")
+            elif choice == '6':
+                if not client.groups:
+                    print("You are not in any groups.")
+                else:
+                    print("\nYour groups:")
+                    for group_id, group_info in client.groups.items():
+                        print(f"  ID: {group_id}")
+                        print(f"  Name: {group_info['name']}")
+                        print(f"  Members: {', '.join(group_info['members'])}")
+                        print("-" * 30)
+            elif choice == '7':
                 client.is_authenticated = False
                 print("Logged out.")
 

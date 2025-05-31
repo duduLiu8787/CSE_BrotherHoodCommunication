@@ -175,7 +175,7 @@ class CSEKACLS:
             w_dek_data = CryptoUtils.encrypt_aes_gcm(
                 self.kek,
                 dek,
-                associated_data=client_id.encode('utf-8')
+                
             )
             
             # 記錄操作
@@ -210,11 +210,11 @@ class CSEKACLS:
             return {'status': 'error', 'message': message}
         
         try:
-            # 使用KEK解密DEK
+            # 使用KEK解密DEK（不解碼為文字）
             dek = CryptoUtils.decrypt_aes_gcm(
                 self.kek,
                 w_dek_data,
-                associated_data=client_id.encode('utf-8')
+                decode_text=False  # 重要：DEK 是二進制數據
             )
             
             # 記錄操作
@@ -235,7 +235,6 @@ class CSEKACLS:
         except Exception as e:
             self.logger.error(f"Error unwrapping DEK: {e}")
             return {'status': 'error', 'message': 'Failed to unwrap DEK'}
-
     def _handle_update_services(self, request):
         """處理服務更新請求"""
         services = request.get('services', {})
