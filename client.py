@@ -286,12 +286,37 @@ class CSEClient:
                             
                             # 顯示新訊息通知
                             for msg_info in new_messages:
-                                if msg_info.get('group_name'):
+                                if msg_info.get('type') == 'group_invite':
+                                    # 處理群組邀請
+                                    group_id = msg_info['group_id']
+                                    
+                                    # 先加入基本資訊
+                                    self.groups[group_id] = {
+                                        'name': msg_info['group_name'],
+                                        'members': []
+                                    }
+                                    
+                                    # 獲取完整群組資訊
+                                    request = {
+                                        'type': 'get_group_info',
+                                        'client_id': self.client_id,
+                                        'group_id': group_id
+                                    }
+                                    response = NetworkUtils.send_tcp_message(self.server_host, self.server_port, request)
+                                    
+                                    if response.get('status') == 'success':
+                                        group_info = response.get('group')
+                                        self.groups[group_id]['members'] = group_info['members']
+                                    
+                                    print(f"\n🎉 You've been added to group '{msg_info['group_name']}' by {msg_info['invited_by']}")
+                                    print(f"   Members: {', '.join(self.groups[group_id]['members'])}")
+                                elif msg_info.get('group_name'):
+                                    # 原有的群組訊息處理
                                     print(f"\n🔔 New group message in '{msg_info['group_name']}' from {msg_info['from']} (ID: {msg_info['message_id']})")
                                 else:
+                                    # 原有的個人訊息處理
                                     print(f"\n🔔 New message from {msg_info['from']} (ID: {msg_info['message_id']})")
                                 print("Type '4' to read messages or continue with your selection.")
-                    
                 except Exception as e:
                     self.logger.error(f"Message check failed: {e}")
                 

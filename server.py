@@ -121,6 +121,8 @@ class CSEServer:
             return self._handle_create_group(request, client_addr)
         elif request_type == 'get_my_groups':
             return self._handle_get_my_groups(request)
+        elif request_type == 'get_group_info':
+            return self._handle_get_group_info(request)
         else:
             return {'status': 'error', 'message': 'Unknown request type'}
     
@@ -234,7 +236,21 @@ class CSEServer:
             }
         
         self.logger.info(f"Group '{group_name}' (ID: {group_id}) created by {client_id}")
-        
+        # 通知所有成員（除了創建者）
+        for member_id in members:
+            if member_id != client_id and member_id in self.online_clients:
+                notification_id = f"group_invite_{group_id}_{member_id}_{datetime.utcnow().timestamp()}"
+                
+                with self.client_lock:
+                    self.online_clients[member_id]['pending_messages'].append({
+                        'message_id': notification_id,
+                        'type': 'group_invite',
+                        'group_id': group_id,
+                        'group_name': group_name,
+                        'invited_by': client_id,
+                        'timestamp': datetime.utcnow().isoformat()
+                    })
+
         return {
             'status': 'success',
             'group_id': group_id,
@@ -260,6 +276,20 @@ class CSEServer:
             'groups': my_groups
         }
     
+    def _handle_get_group_info(self, request):
+        """獲取單一群組的詳細資訊"""
+        group_id = request.get('group_id')
+        client_id = request.get('client_id')
+        
+        with self.group_lock:
+            if group_id in self.groups and client_id in self.groups[group_id]['members']:
+                return {
+                    'status': 'success',
+                    'group': self.groups[group_id]
+                }
+        
+        return {'status': 'error', 'message': 'Group not found or access denied'}
+
     def _handle_send_group_message(self, request, client_addr):
         """處理發送群組訊息請求"""
         sender_id = request.get('sender_id')
