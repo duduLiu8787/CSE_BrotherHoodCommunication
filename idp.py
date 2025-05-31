@@ -1,464 +1,735 @@
 #!/usr/bin/env python3
 """
-CSE Communication System - Client Component
-客戶端應用程式，用於加密通訊
+CSE Communication System - Server Component
+負責轉送加密內容、驗證權限、管理在線成員、管理群組
 """
 
 import sys
 import json
 import threading
 import time
-import getpass
 from datetime import datetime
 from common_utils import *
 
-class CSEClient:
-    def __init__(self, client_id, server_host):
-        self.client_id = client_id
-        self.server_host = server_host
-        self.logger = setup_logger(f'CSEClient_{client_id}', f'client_{client_id}.log')
-        self.three_p_jwt = None
-        self.is_authenticated = False
-        self.heartbeat_thread = None
-        self.message_check_thread = None
-        self.new_messages = []
+class CSEServer:
+    def __init__(self, passphrase):
+        self.passphrase = passphrase
+        self.logger = setup_logger('CSEServer', 'server.log')
+        self.registry = ServiceRegistry()
+        self.private_key, self.public_key = CryptoUtils.generate_rsa_keypair()
+        self.online_clients = {}  # {client_id: {'address': addr, 'last_seen': timestamp}}
+        self.messages = {}  # {message_id: {'from': sender, 'to': receiver, 'data': encrypted_data, 'w_dek': w_dek}}
+        self.groups = {}  # {group_id: {'name': name, 'members': [client_ids], 'created_by': client_id}}
+        self.client_lock = threading.Lock()
         self.message_lock = threading.Lock()
-        self.groups = {}  # 儲存已加入的群組
-
-        # 服務端口
-        self.server_port = NetworkUtils.SERVICE_PORTS['server']
-        self.idp_port = NetworkUtils.SERVICE_PORTS['idp']
-        self.kacls_port = NetworkUtils.SERVICE_PORTS['kacls']
+        self.group_lock = threading.Lock()
+        self.is_broadcasting = True
+        self.continue_broadcast_for_clients = True  # 新增：控制是否為客戶端繼續廣播
         
-        self.logger.info(f"Client {client_id} initialized")
+        # Server 自己不需要註冊到 registry，但需要記錄需要的服務
+        self.required_services = {'idp', 'kacls'}
+        
+        self.logger.info("Server initialized")
     
-    def register(self, idp_host, password):
-        """向IdP註冊"""
-        request = {
-            'type': 'register',
-            'client_id': self.client_id,
-            'password': password
-        }
-        
-        response = NetworkUtils.send_tcp_message(idp_host, self.idp_port, request)
-        
-        if response.get('status') == 'success':
-            self.three_p_jwt = response.get('3p_jwt')
-            self.logger.info("Registration successful")
-            return True
-        else:
-            self.logger.error(f"Registration failed: {response.get('message')}")
-            return False
+    def _are_all_services_registered(self):
+        """檢查是否所有必需的服務都已註冊"""
+        with self.registry.lock:
+            registered = set(self.registry.services.keys())
+            return self.required_services.issubset(registered)
     
-    def authenticate(self, idp_host, password):
-        """向IdP認證"""
-        request = {
-            'type': 'authenticate',
-            'client_id': self.client_id,
-            'password': password
-        }
+    def start(self):
+        """啟動服務器"""
+        # 先啟動TCP服務
+        tcp_thread = threading.Thread(target=self._start_tcp_service)
+        tcp_thread.daemon = True
+        tcp_thread.start()
         
-        response = NetworkUtils.send_tcp_message(idp_host, self.idp_port, request)
+        # 等待TCP服務啟動
+        time.sleep(1)
         
-        if response.get('status') == 'success':
-            self.three_p_jwt = response.get('3p_jwt')
-            self.is_authenticated = True
-            self.logger.info("Authentication successful")
-            
-            # 向Server註冊
-            self._register_with_server()
-            
-            # 獲取已加入的群組
-            self._get_my_groups()
-            
-            # 啟動心跳線程
-            self._start_heartbeat()
-
-            # 啟動訊息檢查線程
-            self._start_message_checker()
-
-            return True
-        else:
-            self.logger.error(f"Authentication failed: {response.get('message')}")
-            return False
+        # 啟動廣播線程
+        broadcast_thread = threading.Thread(target=self._broadcast_service)
+        broadcast_thread.daemon = True
+        broadcast_thread.start()
+        
+        # 啟動廣播監聽線程（保留但可能不會收到訊息）
+        listen_thread = threading.Thread(target=self._listen_for_services)
+        listen_thread.daemon = True
+        listen_thread.start()
+        
+        # 等待所有服務註冊完成，增加調試訊息
+        self.logger.info("Waiting for all services to register...")
+        while not self._are_all_services_registered():
+            # 每5秒輸出一次當前註冊狀態
+            with self.registry.lock:
+                registered = list(self.registry.services.keys())
+            self.logger.debug(f"Currently registered services: {registered}")
+            self.logger.debug(f"Required services: {list(self.required_services)}")
+            time.sleep(5)
+        
+        self.is_broadcasting = False
+        self.logger.info("All services registered, stopping service discovery broadcast")
+        
+        # 輸出最終註冊的服務
+        with self.registry.lock:
+            final_services = list(self.registry.services.keys())
+        self.logger.info(f"Final registered services: {final_services}")
+        
+        # 但繼續為客戶端廣播
+        client_broadcast_thread = threading.Thread(target=self._broadcast_for_clients)
+        client_broadcast_thread.daemon = True
+        client_broadcast_thread.start()
+        
+        # 保持主線程運行
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self.continue_broadcast_for_clients = False
+            pass
     
-    def _register_with_server(self):
-        """向Server註冊"""
-        request = {
-            'type': 'register_client',
-            'client_id': self.client_id,
-            '3p_jwt': self.three_p_jwt
-        }
-        
-        response = NetworkUtils.send_tcp_message(self.server_host, self.server_port, request)
-        
-        if response.get('status') == 'success':
-            self.logger.info("Registered with server")
-        else:
-            self.logger.error(f"Server registration failed: {response.get('message')}")
+    def _broadcast_service(self):
+        """廣播服務存在（用於服務發現）"""
+        while self.is_broadcasting:
+            message = {
+                'type': 'service_announcement',
+                'role': 'server',
+                'public_key': CryptoUtils.serialize_public_key(self.public_key),
+                'port': NetworkUtils.SERVICE_PORTS['server']
+            }
+            NetworkUtils.send_broadcast(message, self.passphrase)
+            self.logger.debug("Broadcasted service announcement")
+            time.sleep(5)
     
-    def _start_heartbeat(self):
-        """啟動心跳線程"""
-        def heartbeat():
-            while self.is_authenticated:
-                request = {
-                    'type': 'heartbeat',
-                    'client_id': self.client_id
+    def _broadcast_for_clients(self):
+        """為客戶端持續廣播"""
+        self.logger.info("Starting client discovery broadcast")
+        while self.continue_broadcast_for_clients:
+            # 只有在所有服務都準備好後才廣播
+            if self._are_all_services_registered():
+                message = {
+                    'type': 'service_announcement',
+                    'role': 'server',
+                    'public_key': CryptoUtils.serialize_public_key(self.public_key),
+                    'port': NetworkUtils.SERVICE_PORTS['server']
                 }
-                try:
-                    NetworkUtils.send_tcp_message(self.server_host, self.server_port, request)
-                except Exception as e:
-                    self.logger.error(f"Heartbeat failed: {e}")
-                time.sleep(60)  # 每分鐘發送一次心跳
-        
-        self.heartbeat_thread = threading.Thread(target=heartbeat)
-        self.heartbeat_thread.daemon = True
-        self.heartbeat_thread.start()
+                NetworkUtils.send_broadcast(message, self.passphrase)
+                self.logger.debug("Broadcasted for client discovery")
+            time.sleep(5)  # 每5秒廣播一次
     
-    def get_online_clients(self):
-        """獲取在線客戶端列表"""
-        request = {
-            'type': 'get_online_clients',
-            'client_id': self.client_id
+    def _listen_for_services(self):
+        """監聽其他服務的響應（目前服務是透過TCP響應，所以這個方法可能不會收到訊息）"""
+        def handle_broadcast(message, addr):
+            # 這個方法保留但可能不會被使用，因為服務現在是透過TCP響應
+            if message.get('type') == 'service_response':
+                role = message.get('role')
+                if role in ['idp', 'kacls']:
+                    # 驗證通關密語
+                    if message.get('passphrase') == self.passphrase:
+                        public_key = CryptoUtils.deserialize_public_key(message.get('public_key'))
+                        self.registry.register_service(role, addr, public_key)
+                        self.logger.info(f"Registered {role} service from {addr} via broadcast")
+        
+        NetworkUtils.listen_broadcast(self.passphrase, handle_broadcast)
+    
+    def _start_tcp_service(self):
+        """啟動TCP服務"""
+        NetworkUtils.start_tcp_server(
+            NetworkUtils.SERVICE_PORTS['server'],
+            self._handle_client_request
+        )
+    
+    def _handle_client_request(self, request, client_addr):
+        """處理客戶端請求"""
+        request_type = request.get('type')
+        self.logger.debug(f"Handling request type: {request_type} from {client_addr}")
+        
+        try:
+            if request_type == 'service_response':
+                return self._handle_service_response(request, client_addr)
+            elif request_type == 'client_discovery':
+                return self._handle_client_discovery(request, client_addr)
+            elif request_type == 'register_client':
+                return self._handle_client_registration(request, client_addr)
+            elif request_type == 'send_message':
+                return self._handle_send_message(request, client_addr)
+            elif request_type == 'send_group_message':
+                return self._handle_send_group_message(request, client_addr)
+            elif request_type == 'get_message':
+                return self._handle_get_message(request, client_addr)
+            elif request_type == 'get_online_clients':
+                return self._handle_get_online_clients(request)
+            elif request_type == 'check_messages':
+                return self._handle_check_messages(request)
+            elif request_type == 'verify_jwt':
+                return self._handle_verify_jwt(request)
+            elif request_type == 'heartbeat':
+                return self._handle_heartbeat(request, client_addr)
+            elif request_type == 'create_group':
+                return self._handle_create_group(request, client_addr)
+            elif request_type == 'get_my_groups':
+                return self._handle_get_my_groups(request)
+            elif request_type == 'get_group_info':
+                return self._handle_get_group_info(request)
+            else:
+                return {'status': 'error', 'message': f'Unknown request type: {request_type}'}
+        except Exception as e:
+            self.logger.error(f"Error handling request type {request_type}: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'status': 'error', 'message': str(e)}
+    
+    def _handle_client_discovery(self, request, client_addr):
+        """處理客戶端發現請求"""
+        client_id = request.get('client_id')
+        passphrase = request.get('passphrase')
+        
+        # 驗證通關密語
+        if passphrase != self.passphrase:
+            self.logger.warning(f"Client {client_id} provided incorrect passphrase")
+            return {'status': 'error', 'message': 'Invalid passphrase'}
+        
+        # 檢查所有服務是否都已註冊
+        if not self._are_all_services_registered():
+            self.logger.warning(f"Client {client_id} tried to connect before all services are ready")
+            return {'status': 'error', 'message': 'Services not ready'}
+        
+        # 準備服務信息
+        services_info = {}
+        
+        # 添加IdP信息
+        idp_addr = self.registry.get_service('idp')
+        if idp_addr:
+            services_info['idp'] = {
+                'address': idp_addr,
+                'public_key': CryptoUtils.serialize_public_key(self.registry.get_public_key('idp'))
+            }
+        
+        # 添加KACLS信息
+        kacls_addr = self.registry.get_service('kacls')
+        if kacls_addr:
+            services_info['kacls'] = {
+                'address': kacls_addr,
+                'public_key': CryptoUtils.serialize_public_key(self.registry.get_public_key('kacls'))
+            }
+        
+        self.logger.info(f"Client {client_id} discovered services successfully")
+        
+        return {
+            'status': 'success',
+            'message': 'Services discovered',
+            'services': services_info
         }
+    
+    def _are_all_services_registered(self):
+        """檢查是否所有必需的服務都已註冊"""
+        with self.registry.lock:
+            registered = set(self.registry.services.keys())
+            return self.required_services.issubset(registered)
+        """處理客戶端發現請求"""
+        client_id = request.get('client_id')
+        passphrase = request.get('passphrase')
         
-        response = NetworkUtils.send_tcp_message(self.server_host, self.server_port, request)
+        # 驗證通關密語
+        if passphrase != self.passphrase:
+            self.logger.warning(f"Client {client_id} provided incorrect passphrase")
+            return {'status': 'error', 'message': 'Invalid passphrase'}
         
-        if response.get('status') == 'success':
-            return response.get('online_clients', [])
+        # 檢查所有服務是否都已註冊
+        if not self._are_all_services_registered():
+            self.logger.warning(f"Client {client_id} tried to connect before all services are ready")
+            return {'status': 'error', 'message': 'Services not ready'}
+        
+        # 準備服務信息
+        services_info = {}
+        
+        # 添加IdP信息
+        idp_addr = self.registry.get_service('idp')
+        if idp_addr:
+            services_info['idp'] = {
+                'address': idp_addr,
+                'public_key': CryptoUtils.serialize_public_key(self.registry.get_public_key('idp'))
+            }
+        
+        # 添加KACLS信息
+        kacls_addr = self.registry.get_service('kacls')
+        if kacls_addr:
+            services_info['kacls'] = {
+                'address': kacls_addr,
+                'public_key': CryptoUtils.serialize_public_key(self.registry.get_public_key('kacls'))
+            }
+        
+        self.logger.info(f"Client {client_id} discovered services successfully")
+        
+        return {
+            'status': 'success',
+            'message': 'Services discovered',
+            'services': services_info
+        }
+    
+    def _handle_service_response(self, request, client_addr):
+        """處理服務響應"""
+        role = request.get('role')
+        self.logger.debug(f"Received service response from {client_addr}, role: {role}")
+        
+        if role in ['idp', 'kacls']:
+            # 驗證通關密語
+            if request.get('passphrase') == self.passphrase:
+                public_key = CryptoUtils.deserialize_public_key(request.get('public_key'))
+                self.registry.register_service(role, client_addr, public_key)
+                self.logger.info(f"Registered {role} service from {client_addr}")
+                
+                # 檢查並輸出當前註冊狀態
+                with self.registry.lock:
+                    current_services = list(self.registry.services.keys())
+                self.logger.info(f"Current registered services: {current_services}")
+                self.logger.info(f"All services registered: {self._are_all_services_registered()}")
+                
+                # 回傳其他服務的資訊
+                other_services = {}
+                if role == 'idp' and self.registry.get_service('kacls'):
+                    other_services['kacls'] = {
+                        'address': self.registry.get_service('kacls'),
+                        'public_key': CryptoUtils.serialize_public_key(self.registry.get_public_key('kacls'))
+                    }
+                elif role == 'kacls' and self.registry.get_service('idp'):
+                    other_services['idp'] = {
+                        'address': self.registry.get_service('idp'),
+                        'public_key': CryptoUtils.serialize_public_key(self.registry.get_public_key('idp'))
+                    }
+                
+                if self._are_all_services_registered():
+                    self.logger.info("All services now registered, will notify others")
+                    self._notify_services_update()
+                    
+                return {
+                    'status': 'success', 
+                    'message': f'{role} registered successfully',
+                    'other_services': other_services
+                }
+            else:
+                self.logger.warning(f"Invalid passphrase from {role} at {client_addr}")
         else:
-            self.logger.error(f"Failed to get online clients: {response.get('message')}")
-            return []
+            self.logger.warning(f"Unknown service role: {role}")
+            
+        return {'status': 'error', 'message': 'Invalid service response'}
     
-    def create_group(self, group_name, member_ids):
-        """創建群組"""
-        request = {
-            'type': 'create_group',
-            'client_id': self.client_id,
-            'group_name': group_name,
-            'members': member_ids
+    def _handle_check_messages(self, request):
+        """檢查是否有新訊息"""
+        client_id = request.get('client_id')
+    
+        with self.client_lock:
+            if client_id not in self.online_clients:
+                return {'status': 'error', 'message': 'Client not registered'}
+        
+            pending_messages = self.online_clients[client_id].get('pending_messages', [])
+        
+            # 清空待處理訊息列表
+            self.online_clients[client_id]['pending_messages'] = []
+    
+        return {
+            'status': 'success',
+            'new_messages': pending_messages
+        }
+
+    def _handle_client_registration(self, request, client_addr):
+        """處理客戶端註冊"""
+        client_id = request.get('client_id')
+        
+        # 驗證客戶端是否已在IdP註冊
+        idp_addr = self.registry.get_service('idp')
+        if not idp_addr:
+            return {'status': 'error', 'message': 'IdP service not available'}
+        
+        # 向IdP驗證客戶端
+        verify_request = {
+            'type': 'verify_client',
+            'client_id': client_id,
+            '3p_jwt': request.get('3p_jwt')
         }
         
-        response = NetworkUtils.send_tcp_message(self.server_host, self.server_port, request)
+        idp_response = NetworkUtils.send_tcp_message(
+            idp_addr,
+            NetworkUtils.SERVICE_PORTS['idp'],
+            verify_request
+        )
         
-        if response.get('status') == 'success':
-            group_id = response.get('group_id')
+        if idp_response.get('status') == 'success':
+            with self.client_lock:
+                self.online_clients[client_id] = {
+                    'address': client_addr,
+                    'last_seen': datetime.utcnow().isoformat(),
+                    'pending_messages': []
+                }
+            self.logger.info(f"Client {client_id} registered from {client_addr}")
+            return {'status': 'success', 'message': 'Client registered successfully'}
+        else:
+            return {'status': 'error', 'message': 'Client verification failed'}
+    
+    def _handle_create_group(self, request, client_addr):
+        """處理創建群組請求"""
+        client_id = request.get('client_id')
+        group_name = request.get('group_name')
+        members = request.get('members', [])
+        
+        # 驗證客戶端身份
+        if client_id not in self.online_clients:
+            return {'status': 'error', 'message': 'Client not registered'}
+        
+        # 確保創建者在成員列表中
+        if client_id not in members:
+            members.append(client_id)
+        
+        # 生成群組ID
+        group_id = f"group_{datetime.utcnow().timestamp()}_{client_id}"
+        
+        # 創建群組
+        with self.group_lock:
             self.groups[group_id] = {
                 'name': group_name,
-                'members': member_ids
+                'members': members,
+                'created_by': client_id,
+                'created_at': datetime.utcnow().isoformat()
             }
-            self.logger.info(f"Group '{group_name}' created with ID: {group_id}")
-            return True, group_id
-        else:
-            self.logger.error(f"Failed to create group: {response.get('message')}")
-            return False, response.get('message')
-    
-    def _get_my_groups(self):
-        """獲取已加入的群組"""
-        request = {
-            'type': 'get_my_groups',
-            'client_id': self.client_id
+        
+        self.logger.info(f"Group '{group_name}' (ID: {group_id}) created by {client_id}")
+        # 通知所有成員（除了創建者）
+        for member_id in members:
+            if member_id != client_id and member_id in self.online_clients:
+                notification_id = f"group_invite_{group_id}_{member_id}_{datetime.utcnow().timestamp()}"
+                
+                with self.client_lock:
+                    self.online_clients[member_id]['pending_messages'].append({
+                        'message_id': notification_id,
+                        'type': 'group_invite',
+                        'group_id': group_id,
+                        'group_name': group_name,
+                        'invited_by': client_id,
+                        'timestamp': datetime.utcnow().isoformat()
+                    })
+
+        return {
+            'status': 'success',
+            'group_id': group_id,
+            'message': 'Group created successfully'
         }
-        
-        response = NetworkUtils.send_tcp_message(self.server_host, self.server_port, request)
-        
-        if response.get('status') == 'success':
-            self.groups = response.get('groups', {})
-            self.logger.info(f"Retrieved {len(self.groups)} groups")
-        else:
-            self.logger.error(f"Failed to get groups: {response.get('message')}")
     
-    def send_message(self, receiver_id, message, kacls_host, is_group=False):
-        """發送加密訊息"""
-        # 生成DEK
-        dek = CryptoUtils.generate_aes_key()
+    def _handle_get_my_groups(self, request):
+        """處理獲取我的群組請求"""
+        client_id = request.get('client_id')
         
-        # 加密訊息
-        encrypted_message = CryptoUtils.encrypt_aes_gcm(dek, message)
+        # 獲取客戶端所在的所有群組
+        my_groups = {}
+        with self.group_lock:
+            for group_id, group_info in self.groups.items():
+                if client_id in group_info['members']:
+                    my_groups[group_id] = {
+                        'name': group_info['name'],
+                        'members': group_info['members']
+                    }
         
-        # 向KACLS請求包裝DEK
-        wrap_request = {
-            'type': 'wrap_dek',
-            '3p_jwt': self.three_p_jwt,
-            'dek': base64.b64encode(dek).decode('utf-8'),
-            'client_id': self.client_id
+        return {
+            'status': 'success',
+            'groups': my_groups
         }
-        
-        wrap_response = NetworkUtils.send_tcp_message(kacls_host, self.kacls_port, wrap_request)
-        
-        if wrap_response.get('status') != 'success':
-            self.logger.error(f"Failed to wrap DEK: {wrap_response.get('message')}")
-            return False
-        
-        w_dek = wrap_response.get('w_dek')
-        
-        # 發送加密訊息到Server
-        send_request = {
-            'type': 'send_group_message' if is_group else 'send_message',
-            'sender_id': self.client_id,
-            'receiver_id': receiver_id,  # 如果是群組，這裡是group_id
-            'encrypted_data': encrypted_message,
-            'w_dek': w_dek
-        }
-        
-        send_response = NetworkUtils.send_tcp_message(self.server_host, self.server_port, send_request)
-        
-        if send_response.get('status') == 'success':
-            target_type = "group" if is_group else "user"
-            self.logger.info(f"Message sent to {target_type} {receiver_id}")
-            return True
-        else:
-            self.logger.error(f"Failed to send message: {send_response.get('message')}")
-            return False
     
-    def receive_message(self, message_id, b_jwt, kacls_host):
-        """接收並解密訊息"""
-        # 從Server獲取訊息
-        get_request = {
-            'type': 'get_message',
-            'client_id': self.client_id,
+    def _handle_get_group_info(self, request):
+        """獲取單一群組的詳細資訊"""
+        group_id = request.get('group_id')
+        client_id = request.get('client_id')
+        
+        with self.group_lock:
+            if group_id in self.groups and client_id in self.groups[group_id]['members']:
+                return {
+                    'status': 'success',
+                    'group': self.groups[group_id]
+                }
+        
+        return {'status': 'error', 'message': 'Group not found or access denied'}
+
+    def _handle_send_group_message(self, request, client_addr):
+        """處理發送群組訊息請求"""
+        sender_id = request.get('sender_id')
+        group_id = request.get('receiver_id')  # 這裡receiver_id實際上是group_id
+        encrypted_data = request.get('encrypted_data')
+        w_dek = request.get('w_dek')
+        
+        # 驗證發送者身份
+        if sender_id not in self.online_clients:
+            return {'status': 'error', 'message': 'Sender not registered'}
+        
+        # 檢查群組是否存在
+        with self.group_lock:
+            if group_id not in self.groups:
+                return {'status': 'error', 'message': 'Group not found'}
+            
+            group_info = self.groups[group_id]
+            
+            # 檢查發送者是否是群組成員
+            if sender_id not in group_info['members']:
+                return {'status': 'error', 'message': 'Sender not a member of this group'}
+            
+            # 為每個群組成員創建訊息
+            for member_id in group_info['members']:
+                if member_id == sender_id:  # 跳過發送者自己
+                    continue
+                
+                if member_id not in self.online_clients:  # 跳過離線成員
+                    continue
+                
+                # 生成訊息ID
+                message_id = f"group_{group_id}_{sender_id}_{member_id}_{datetime.utcnow().timestamp()}"
+                
+                # 創建B_JWT
+                b_jwt = JWTUtils.create_b_jwt(
+                    member_id,
+                    message_id,
+                    ['read'],
+                    self.private_key
+                )
+                
+                # 儲存訊息
+                with self.message_lock:
+                    self.messages[message_id] = {
+                        'from': sender_id,
+                        'to': member_id,
+                        'group_id': group_id,
+                        'group_name': group_info['name'],
+                        'data': encrypted_data,
+                        'w_dek': w_dek,
+                        'timestamp': datetime.utcnow().isoformat(),
+                        'read': False
+                    }
+                
+                # 將新訊息加入接收者的待處理列表
+                with self.client_lock:
+                    if 'pending_messages' not in self.online_clients[member_id]:
+                        self.online_clients[member_id]['pending_messages'] = []
+                    
+                    self.online_clients[member_id]['pending_messages'].append({
+                        'message_id': message_id,
+                        'from': sender_id,
+                        'group_id': group_id,
+                        'group_name': group_info['name'],
+                        'b_jwt': b_jwt,
+                        'timestamp': datetime.utcnow().isoformat()
+                    })
+                
+                self.logger.info(f"Group message {message_id} stored for {member_id}")
+        
+        return {
+            'status': 'success',
+            'message': 'Group message sent successfully'
+        }
+    
+    def _handle_send_message(self, request, client_addr):
+        """處理發送訊息請求"""
+        sender_id = request.get('sender_id')
+        receiver_id = request.get('receiver_id')
+        encrypted_data = request.get('encrypted_data')
+        w_dek = request.get('w_dek')
+        
+        # 驗證發送者身份
+        if sender_id not in self.online_clients:
+            return {'status': 'error', 'message': 'Sender not registered'}
+        
+        # 檢查接收者是否在線
+        if receiver_id not in self.online_clients:
+            return {'status': 'error', 'message': 'Receiver not online'}
+        
+        # 生成訊息ID
+        message_id = f"{sender_id}_{receiver_id}_{datetime.utcnow().timestamp()}"
+        
+        # 先創建B_JWT
+        b_jwt = JWTUtils.create_b_jwt(
+            receiver_id,
+            message_id,
+            ['read'],
+            self.private_key
+        )
+        
+        # 儲存訊息
+        with self.message_lock:
+            self.messages[message_id] = {
+                'from': sender_id,
+                'to': receiver_id,
+                'data': encrypted_data,
+                'w_dek': w_dek,
+                'timestamp': datetime.utcnow().isoformat(),
+                'read': False
+            }
+        
+        # 將新訊息加入接收者的待處理列表
+        with self.client_lock:
+            if 'pending_messages' not in self.online_clients[receiver_id]:
+                self.online_clients[receiver_id]['pending_messages'] = []
+            
+            self.online_clients[receiver_id]['pending_messages'].append({
+                'message_id': message_id,
+                'from': sender_id,
+                'b_jwt': b_jwt,
+                'timestamp': datetime.utcnow().isoformat()
+            })
+        
+        self.logger.info(f"Message {message_id} stored for {receiver_id}")
+        
+        return {
+            'status': 'success',
             'message_id': message_id,
             'b_jwt': b_jwt
         }
+    
+    def _handle_get_message(self, request, client_addr):
+        """處理獲取訊息請求"""
+        client_id = request.get('client_id')
+        message_id = request.get('message_id')
+        b_jwt = request.get('b_jwt')
         
-        get_response = NetworkUtils.send_tcp_message(self.server_host, self.server_port, get_request)
+        # 驗證B_JWT
+        payload = JWTUtils.verify_jwt(b_jwt, self.public_key)
+        if not payload or payload.get('user_id') != client_id:
+            return {'status': 'error', 'message': 'Invalid B_JWT'}
         
-        if get_response.get('status') != 'success':
-            self.logger.error(f"Failed to get message: {get_response.get('message')}")
-            return None
+        # 檢查權限
+        if 'read' not in payload.get('permissions', []):
+            return {'status': 'error', 'message': 'No read permission'}
         
-        message_data = get_response.get('message')
+        # 獲取訊息
+        with self.message_lock:
+            message = self.messages.get(message_id)
+            if not message:
+                return {'status': 'error', 'message': 'Message not found'}
+            
+            if message['to'] != client_id:
+                return {'status': 'error', 'message': 'Access denied'}
         
-        # 向KACLS請求解包DEK
-        unwrap_request = {
-            'type': 'unwrap_dek',
-            '3p_jwt': self.three_p_jwt,
-            'b_jwt': b_jwt,
-            'w_dek': message_data['w_dek'],
-            'client_id': self.client_id
+        response_data = {
+            'status': 'success',
+            'message': {
+                'from': message['from'],
+                'data': message['data'],
+                'w_dek': message['w_dek'],
+                'timestamp': message['timestamp']
+            }
         }
         
-        unwrap_response = NetworkUtils.send_tcp_message(kacls_host, self.kacls_port, unwrap_request)
+        # 如果是群組訊息，加入群組資訊
+        if 'group_id' in message:
+            response_data['message']['group_id'] = message['group_id']
+            response_data['message']['group_name'] = message['group_name']
         
-        if unwrap_response.get('status') != 'success':
-            self.logger.error(f"Failed to unwrap DEK: {unwrap_response.get('message')}")
-            return None
-        
-        dek = base64.b64decode(unwrap_response.get('dek'))
-        
-        # 解密訊息
-        try:
-            decrypted_message = CryptoUtils.decrypt_aes_gcm(dek, message_data['data'])
-            self.logger.info(f"Message received from {message_data['from']}")
-            return {
-                'from': message_data['from'],
-                'message': decrypted_message,
-                'timestamp': message_data['timestamp'],
-                'group_id': message_data.get('group_id'),
-                'group_name': message_data.get('group_name')
-            }
-        except Exception as e:
-            self.logger.error(f"Failed to decrypt message: {e}")
-            return None
+        return response_data
     
-    def _start_message_checker(self):
-        """啟動訊息檢查線程"""
-        def check_messages():
-            while self.is_authenticated:
-                try:
-                    request = {
-                        'type': 'check_messages',
-                        'client_id': self.client_id
+    def _handle_get_online_clients(self, request):
+        """處理獲取在線客戶端列表請求"""
+        with self.client_lock:
+            # 清理超時的客戶端
+            current_time = datetime.utcnow()
+            timeout_clients = []
+            for client_id, info in self.online_clients.items():
+                last_seen = datetime.fromisoformat(info['last_seen'])
+                if (current_time - last_seen).seconds > 300:  # 5分鐘超時
+                    timeout_clients.append(client_id)
+            
+            for client_id in timeout_clients:
+                del self.online_clients[client_id]
+                self.logger.info(f"Client {client_id} timed out")
+            
+            # 返回在線客戶端列表
+            online_list = list(self.online_clients.keys())
+        
+        return {
+            'status': 'success',
+            'online_clients': online_list
+        }
+    
+    def _handle_verify_jwt(self, request):
+        """處理JWT驗證請求（供其他服務使用）"""
+        token = request.get('token')
+        token_type = request.get('token_type')
+        
+        if token_type == 'B_JWT':
+            payload = JWTUtils.verify_jwt(token, self.public_key)
+            if payload and payload.get('type') == 'B_JWT':
+                return {'status': 'success', 'valid': True, 'payload': payload}
+        
+        return {'status': 'success', 'valid': False}
+    
+    def _handle_heartbeat(self, request, client_addr):
+        """處理心跳包"""
+        client_id = request.get('client_id')
+        
+        with self.client_lock:
+            if client_id in self.online_clients:
+                self.online_clients[client_id]['last_seen'] = datetime.utcnow().isoformat()
+                return {'status': 'success'}
+        
+        return {'status': 'error', 'message': 'Client not registered'}
+    
+    def _notify_services_update(self):
+        """通知所有服務更新其他服務的資訊"""
+        self.logger.info("Notifying all services about complete registry")
+        
+        idp_addr = self.registry.get_service('idp')
+        kacls_addr = self.registry.get_service('kacls')
+        
+        # 通知 IdP 關於 KACLS
+        if idp_addr and kacls_addr:
+            update_request = {
+                'type': 'update_services',
+                'services': {
+                    'kacls': {
+                        'address': kacls_addr,
+                        'public_key': CryptoUtils.serialize_public_key(self.registry.get_public_key('kacls'))
                     }
-                    
-                    response = NetworkUtils.send_tcp_message(
-                        self.server_host, 
-                        self.server_port, 
-                        request
-                    )
-                    
-                    if response.get('status') == 'success':
-                        new_messages = response.get('new_messages', [])
-                        
-                        if new_messages:
-                            with self.message_lock:
-                                self.new_messages.extend(new_messages)
-                            
-                            # 顯示新訊息通知
-                            for msg_info in new_messages:
-                                if msg_info.get('type') == 'group_invite':
-                                    # 處理群組邀請
-                                    group_id = msg_info['group_id']
-                                    
-                                    # 先加入基本資訊
-                                    self.groups[group_id] = {
-                                        'name': msg_info['group_name'],
-                                        'members': []
-                                    }
-                                    
-                                    # 獲取完整群組資訊
-                                    request = {
-                                        'type': 'get_group_info',
-                                        'client_id': self.client_id,
-                                        'group_id': group_id
-                                    }
-                                    response = NetworkUtils.send_tcp_message(self.server_host, self.server_port, request)
-                                    
-                                    if response.get('status') == 'success':
-                                        group_info = response.get('group')
-                                        self.groups[group_id]['members'] = group_info['members']
-                                    
-                                    print(f"\n🎉 You've been added to group '{msg_info['group_name']}' by {msg_info['invited_by']}")
-                                    print(f"   Members: {', '.join(self.groups[group_id]['members'])}")
-                                elif msg_info.get('group_name'):
-                                    # 原有的群組訊息處理
-                                    print(f"\n🔔 New group message in '{msg_info['group_name']}' from {msg_info['from']} (ID: {msg_info['message_id']})")
-                                else:
-                                    # 原有的個人訊息處理
-                                    print(f"\n🔔 New message from {msg_info['from']} (ID: {msg_info['message_id']})")
-                                print("Type '4' to read messages or continue with your selection.")
-                except Exception as e:
-                    self.logger.error(f"Message check failed: {e}")
-                
-                time.sleep(3)  # 每3秒檢查一次新訊息
-        
-        self.message_check_thread = threading.Thread(target=check_messages)
-        self.message_check_thread.daemon = True
-        self.message_check_thread.start()
-
-    def read_pending_messages(self, kacls_host):
-        """讀取所有待處理的訊息"""
-        with self.message_lock:
-            pending = self.new_messages.copy()
-            self.new_messages.clear()
-        
-        if not pending:
-            print("No new messages.")
-            return
-        
-        print(f"\n📬 You have {len(pending)} new message(s):")
-        
-        for msg_info in pending:
-            if msg_info.get('group_name'):
-                print(f"\n--- Group message in '{msg_info['group_name']}' from {msg_info['from']} ---")
-            else:
-                print(f"\n--- Message from {msg_info['from']} ---")
-            print(f"Time: {msg_info['timestamp']}")
+                }
+            }
             
-            # 自動接收並解密訊息
-            decrypted = self.receive_message(
-                msg_info['message_id'], 
-                msg_info['b_jwt'], 
-                kacls_host
-            )
+            try:
+                NetworkUtils.send_tcp_message(
+                    idp_addr,
+                    NetworkUtils.SERVICE_PORTS['idp'],
+                    update_request
+                )
+                self.logger.info("Notified IdP about KACLS service")
+            except Exception as e:
+                self.logger.error(f"Failed to notify IdP: {e}")
+        
+        # 通知 KACLS 關於 IdP
+        if kacls_addr and idp_addr:
+            update_request = {
+                'type': 'update_services',
+                'services': {
+                    'idp': {
+                        'address': idp_addr,
+                        'public_key': CryptoUtils.serialize_public_key(self.registry.get_public_key('idp'))
+                    }
+                }
+            }
             
-            if decrypted:
-                print(f"Message: {decrypted['message']}")
-            else:
-                print("Failed to decrypt message.")
-            print("-" * 40)
+            try:
+                NetworkUtils.send_tcp_message(
+                    kacls_addr,
+                    NetworkUtils.SERVICE_PORTS['kacls'],
+                    update_request
+                )
+                self.logger.info("Notified KACLS about IdP service")
+            except Exception as e:
+                self.logger.error(f"Failed to notify KACLS: {e}")
 
 def main():
-    if len(sys.argv) < 3:
-        print("Usage: python client.py <client_id> <server_host> [idp_host] [kacls_host]")
+    if len(sys.argv) != 2:
+        print("Usage: python server.py <passphrase>")
         sys.exit(1)
     
-    client_id = sys.argv[1]
-    server_host = sys.argv[2]
-    idp_host = sys.argv[3] if len(sys.argv) > 3 else server_host
-    kacls_host = sys.argv[4] if len(sys.argv) > 4 else server_host
+    passphrase = sys.argv[1]
+    server = CSEServer(passphrase)
     
-    client = CSEClient(client_id, server_host)
-    
-    # 互動式命令行界面
-    while True:
-        if not client.is_authenticated:
-            print("\n1. Register")
-            print("2. Login")
-            print("3. Exit")
-            choice = input("Choose an option: ")
-            
-            if choice == '1':
-                password = getpass.getpass("Enter password: ")
-                if client.register(idp_host, password):
-                    print("Registration successful! Please login.")
-            elif choice == '2':
-                password = getpass.getpass("Enter password: ")
-                if client.authenticate(idp_host, password):
-                    print("Login successful!")
-            elif choice == '3':
-                break
-        else:
-            print("\n1. List online clients")
-            print("2. Send direct message")
-            print("3. Send group message")
-            print("4. Read messages")
-            print("5. Create group")
-            print("6. List my groups")
-            print("7. Logout")
-            choice = input("Choose an option: ").strip()
-
-            if choice == '1':
-                online_clients = client.get_online_clients()
-                print(f"Online clients: {', '.join(online_clients)}")
-            elif choice == '2':
-                receiver = input("Enter receiver ID: ").strip()
-                message = input("Enter message: ")
-                if client.send_message(receiver, message, kacls_host):
-                    print("Message sent successfully!")
-                else:
-                    print("Failed to send message.")
-            elif choice == '3':
-                # 列出可用的群組
-                if not client.groups:
-                    print("You are not in any groups. Create a group first.")
-                else:
-                    print("\nYour groups:")
-                    for group_id, group_info in client.groups.items():
-                        print(f"  {group_id}: {group_info['name']} (members: {', '.join(group_info['members'])})")
-                    
-                    group_id = input("Enter group ID: ").strip()
-                    if group_id in client.groups:
-                        message = input("Enter message: ")
-                        if client.send_message(group_id, message, kacls_host, is_group=True):
-                            print("Group message sent successfully!")
-                        else:
-                            print("Failed to send group message.")
-                    else:
-                        print("Invalid group ID.")
-            elif choice == '4':
-                client.read_pending_messages(kacls_host)
-            elif choice == '5':
-                group_name = input("Enter group name: ").strip()
-                members_input = input("Enter member IDs (comma-separated, you are included by default): ").strip()
-                
-                if members_input:
-                    member_ids = [m.strip() for m in members_input.split(',')]
-                else:
-                    member_ids = []
-                
-                # 確保自己在成員列表中
-                if client.client_id not in member_ids:
-                    member_ids.append(client.client_id)
-                
-                success, result = client.create_group(group_name, member_ids)
-                if success:
-                    print(f"Group '{group_name}' created successfully! Group ID: {result}")
-                else:
-                    print(f"Failed to create group: {result}")
-            elif choice == '6':
-                if not client.groups:
-                    print("You are not in any groups.")
-                else:
-                    print("\nYour groups:")
-                    for group_id, group_info in client.groups.items():
-                        print(f"  ID: {group_id}")
-                        print(f"  Name: {group_info['name']}")
-                        print(f"  Members: {', '.join(group_info['members'])}")
-                        print("-" * 30)
-            elif choice == '7':
-                client.is_authenticated = False
-                print("Logged out.")
+    try:
+        server.start()
+    except KeyboardInterrupt:
+        print("\nServer shutting down...")
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()

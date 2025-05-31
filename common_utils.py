@@ -1,4 +1,4 @@
- #!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Common utilities for CSE Communication System
 包含加密、JWT、網路通訊等共用功能
@@ -230,17 +230,28 @@ class NetworkUtils:
             msg_len = struct.pack('>I', len(msg_bytes))
             sock.sendall(msg_len + msg_bytes)
             
-            # 接收回應
-            response_len = struct.unpack('>I', sock.recv(4))[0]
+            # 接收回應長度
+            response_len_data = sock.recv(4)
+            if len(response_len_data) != 4:
+                logging.error(f"Failed to receive response length from {host}:{port}")
+                return None
+                
+            response_len = struct.unpack('>I', response_len_data)[0]
+            
+            # 接收回應數據
             response_data = b''
             while len(response_data) < response_len:
                 packet = sock.recv(response_len - len(response_data))
                 if not packet:
+                    logging.error(f"Connection closed while receiving response from {host}:{port}")
                     return None
                 response_data += packet
             
             return json.loads(response_data.decode('utf-8'))
             
+        except Exception as e:
+            logging.error(f"Error sending TCP message to {host}:{port}: {e}")
+            raise
         finally:
             sock.close()
     
@@ -266,13 +277,19 @@ class NetworkUtils:
         """處理客戶端連接"""
         try:
             # 接收訊息長度
-            msg_len = struct.unpack('>I', client_sock.recv(4))[0]
+            len_data = client_sock.recv(4)
+            if len(len_data) != 4:
+                logging.error(f"Failed to receive message length from {addr}")
+                return
+                
+            msg_len = struct.unpack('>I', len_data)[0]
             
             # 接收訊息
             msg_data = b''
             while len(msg_data) < msg_len:
-                packet = client_sock.recv(msg_len - len(msg_data))
+                packet = client_sock.recv(min(4096, msg_len - len(msg_data)))
                 if not packet:
+                    logging.error(f"Connection closed while receiving data from {addr}")
                     return
                 msg_data += packet
             
@@ -282,12 +299,23 @@ class NetworkUtils:
             response = handler(message, addr[0])
             
             # 發送回應
-            response_bytes = json.dumps(response).encode('utf-8')
-            response_len = struct.pack('>I', len(response_bytes))
-            client_sock.sendall(response_len + response_bytes)
+            if response:
+                response_bytes = json.dumps(response).encode('utf-8')
+                response_len = struct.pack('>I', len(response_bytes))
+                client_sock.sendall(response_len + response_bytes)
             
         except Exception as e:
             logging.error(f"Error handling client {addr}: {e}")
+            import traceback
+            traceback.print_exc()
+            # 嘗試發送錯誤響應
+            try:
+                error_response = {'status': 'error', 'message': str(e)}
+                error_bytes = json.dumps(error_response).encode('utf-8')
+                error_len = struct.pack('>I', len(error_bytes))
+                client_sock.sendall(error_len + error_bytes)
+            except:
+                pass
         finally:
             client_sock.close()
 

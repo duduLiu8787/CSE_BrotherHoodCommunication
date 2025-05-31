@@ -9,13 +9,14 @@ import json
 import threading
 import time
 import getpass
+import socket
+import base64
 from datetime import datetime
 from common_utils import *
 
 class CSEClient:
-    def __init__(self, client_id, server_host):
+    def __init__(self, client_id):
         self.client_id = client_id
-        self.server_host = server_host
         self.logger = setup_logger(f'CSEClient_{client_id}', f'client_{client_id}.log')
         self.three_p_jwt = None
         self.is_authenticated = False
@@ -24,7 +25,12 @@ class CSEClient:
         self.new_messages = []
         self.message_lock = threading.Lock()
         self.groups = {}  # 儲存已加入的群組
-
+        
+        # 服務發現相關
+        self.services = {}  # 儲存發現的服務 {role: {'address': ip, 'public_key': key}}
+        self.service_discovered = threading.Event()
+        self.stop_discovery = False  # 新增：控制是否停止服務發現
+        
         # 服務端口
         self.server_port = NetworkUtils.SERVICE_PORTS['server']
         self.idp_port = NetworkUtils.SERVICE_PORTS['idp']
@@ -32,8 +38,138 @@ class CSEClient:
         
         self.logger.info(f"Client {client_id} initialized")
     
-    def register(self, idp_host, password):
+    def discover_services(self, passphrase, timeout=30):
+        """通過廣播發現服務"""
+        self.logger.info("Starting service discovery...")
+        self.stop_discovery = False
+        
+        # 啟動監聽線程
+        listen_thread = threading.Thread(
+            target=self._listen_for_server_broadcast, 
+            args=(passphrase,)
+        )
+        listen_thread.daemon = True
+        listen_thread.start()
+        
+        # 等待服務發現完成
+        if self.service_discovered.wait(timeout):
+            self.logger.info("Service discovery completed successfully")
+            # 停止服務發現
+            self.stop_discovery = True
+            # 等待監聽線程結束
+            listen_thread.join(timeout=2)
+            return True
+        else:
+            self.logger.error("Service discovery timeout")
+            self.stop_discovery = True
+            return False
+    
+    def _listen_for_server_broadcast(self, passphrase):
+        """監聽服務器廣播"""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.settimeout(1.0)  # 設置超時，以便可以定期檢查是否需要停止
+        sock.bind(('', NetworkUtils.BROADCAST_PORT))
+        
+        while not self.stop_discovery:
+            try:
+                data, addr = sock.recvfrom(4096)
+                broadcast_data = json.loads(data.decode('utf-8'))
+                
+                # 解密廣播訊息
+                key = CryptoUtils.derive_key_from_passphrase(passphrase)
+                try:
+                    decrypted_msg = CryptoUtils.decrypt_aes_gcm(key, broadcast_data['encrypted'])
+                    message = json.loads(decrypted_msg)
+                    
+                    if message.get('type') == 'service_announcement' and message.get('role') == 'server':
+                        # 如果已經發現服務，忽略後續廣播
+                        if self.service_discovered.is_set():
+                            continue
+                            
+                        self.logger.info(f"Discovered server at {addr[0]}")
+                        # 響應服務器
+                        self._respond_to_server(addr[0], message, passphrase)
+                except Exception:
+                    # 解密失敗，忽略此訊息
+                    pass
+                    
+            except socket.timeout:
+                # 超時是正常的，繼續監聽
+                continue
+            except Exception as e:
+                if not self.stop_discovery:
+                    self.logger.error(f"Error in broadcast listener: {e}")
+        
+        sock.close()
+        self.logger.info("Stopped listening for server broadcasts")
+    
+    def _respond_to_server(self, server_addr, server_message, passphrase):
+        """響應服務器廣播並獲取所有服務信息"""
+        # 如果已經發現服務，不再響應
+        if self.service_discovered.is_set():
+            return
+            
+        # 等待一下確保Server的TCP服務已啟動
+        time.sleep(0.5)
+        
+        # 準備響應
+        response = {
+            'type': 'client_discovery',
+            'client_id': self.client_id,
+            'passphrase': passphrase  # 明文通關密語驗證
+        }
+        
+        # 發送TCP響應給Server
+        try:
+            result = NetworkUtils.send_tcp_message(
+                server_addr,
+                server_message.get('port'),
+                response
+            )
+            
+            if result and result.get('status') == 'success':
+                # 儲存服務信息
+                services_info = result.get('services', {})
+                
+                # 儲存Server信息
+                self.services['server'] = {
+                    'address': server_addr,
+                    'public_key': CryptoUtils.deserialize_public_key(server_message.get('public_key'))
+                }
+                
+                # 儲存其他服務信息
+                for role, info in services_info.items():
+                    self.services[role] = {
+                        'address': info['address'],
+                        'public_key': CryptoUtils.deserialize_public_key(info['public_key'])
+                    }
+                
+                self.logger.info(f"Discovered services: {list(self.services.keys())}")
+                
+                # 標記服務發現完成
+                if all(role in self.services for role in ['server', 'idp', 'kacls']):
+                    self.service_discovered.set()
+                else:
+                    self.logger.warning("Not all services discovered")
+            else:
+                self.logger.error(f"Server response was not successful: {result}")
+        except Exception as e:
+            self.logger.error(f"Failed to respond to server: {e}")
+    
+    def get_service_address(self, role):
+        """獲取服務地址"""
+        if role in self.services:
+            return self.services[role]['address']
+        return None
+    
+    def register(self, password):
         """向IdP註冊"""
+        idp_host = self.get_service_address('idp')
+        if not idp_host:
+            self.logger.error("IdP service not discovered")
+            return False
+            
         request = {
             'type': 'register',
             'client_id': self.client_id,
@@ -50,8 +186,13 @@ class CSEClient:
             self.logger.error(f"Registration failed: {response.get('message')}")
             return False
     
-    def authenticate(self, idp_host, password):
+    def authenticate(self, password):
         """向IdP認證"""
+        idp_host = self.get_service_address('idp')
+        if not idp_host:
+            self.logger.error("IdP service not discovered")
+            return False
+            
         request = {
             'type': 'authenticate',
             'client_id': self.client_id,
@@ -84,13 +225,18 @@ class CSEClient:
     
     def _register_with_server(self):
         """向Server註冊"""
+        server_host = self.get_service_address('server')
+        if not server_host:
+            self.logger.error("Server service not discovered")
+            return
+            
         request = {
             'type': 'register_client',
             'client_id': self.client_id,
             '3p_jwt': self.three_p_jwt
         }
         
-        response = NetworkUtils.send_tcp_message(self.server_host, self.server_port, request)
+        response = NetworkUtils.send_tcp_message(server_host, self.server_port, request)
         
         if response.get('status') == 'success':
             self.logger.info("Registered with server")
@@ -100,13 +246,14 @@ class CSEClient:
     def _start_heartbeat(self):
         """啟動心跳線程"""
         def heartbeat():
-            while self.is_authenticated:
+            server_host = self.get_service_address('server')
+            while self.is_authenticated and server_host:
                 request = {
                     'type': 'heartbeat',
                     'client_id': self.client_id
                 }
                 try:
-                    NetworkUtils.send_tcp_message(self.server_host, self.server_port, request)
+                    NetworkUtils.send_tcp_message(server_host, self.server_port, request)
                 except Exception as e:
                     self.logger.error(f"Heartbeat failed: {e}")
                 time.sleep(60)  # 每分鐘發送一次心跳
@@ -117,12 +264,17 @@ class CSEClient:
     
     def get_online_clients(self):
         """獲取在線客戶端列表"""
+        server_host = self.get_service_address('server')
+        if not server_host:
+            self.logger.error("Server service not discovered")
+            return []
+            
         request = {
             'type': 'get_online_clients',
             'client_id': self.client_id
         }
         
-        response = NetworkUtils.send_tcp_message(self.server_host, self.server_port, request)
+        response = NetworkUtils.send_tcp_message(server_host, self.server_port, request)
         
         if response.get('status') == 'success':
             return response.get('online_clients', [])
@@ -132,6 +284,11 @@ class CSEClient:
     
     def create_group(self, group_name, member_ids):
         """創建群組"""
+        server_host = self.get_service_address('server')
+        if not server_host:
+            self.logger.error("Server service not discovered")
+            return False, "Server not available"
+            
         request = {
             'type': 'create_group',
             'client_id': self.client_id,
@@ -139,7 +296,7 @@ class CSEClient:
             'members': member_ids
         }
         
-        response = NetworkUtils.send_tcp_message(self.server_host, self.server_port, request)
+        response = NetworkUtils.send_tcp_message(server_host, self.server_port, request)
         
         if response.get('status') == 'success':
             group_id = response.get('group_id')
@@ -155,12 +312,16 @@ class CSEClient:
     
     def _get_my_groups(self):
         """獲取已加入的群組"""
+        server_host = self.get_service_address('server')
+        if not server_host:
+            return
+            
         request = {
             'type': 'get_my_groups',
             'client_id': self.client_id
         }
         
-        response = NetworkUtils.send_tcp_message(self.server_host, self.server_port, request)
+        response = NetworkUtils.send_tcp_message(server_host, self.server_port, request)
         
         if response.get('status') == 'success':
             self.groups = response.get('groups', {})
@@ -168,8 +329,15 @@ class CSEClient:
         else:
             self.logger.error(f"Failed to get groups: {response.get('message')}")
     
-    def send_message(self, receiver_id, message, kacls_host, is_group=False):
+    def send_message(self, receiver_id, message, is_group=False):
         """發送加密訊息"""
+        kacls_host = self.get_service_address('kacls')
+        server_host = self.get_service_address('server')
+        
+        if not kacls_host or not server_host:
+            self.logger.error("Required services not discovered")
+            return False
+            
         # 生成DEK
         dek = CryptoUtils.generate_aes_key()
         
@@ -201,7 +369,7 @@ class CSEClient:
             'w_dek': w_dek
         }
         
-        send_response = NetworkUtils.send_tcp_message(self.server_host, self.server_port, send_request)
+        send_response = NetworkUtils.send_tcp_message(server_host, self.server_port, send_request)
         
         if send_response.get('status') == 'success':
             target_type = "group" if is_group else "user"
@@ -211,8 +379,15 @@ class CSEClient:
             self.logger.error(f"Failed to send message: {send_response.get('message')}")
             return False
     
-    def receive_message(self, message_id, b_jwt, kacls_host):
+    def receive_message(self, message_id, b_jwt):
         """接收並解密訊息"""
+        server_host = self.get_service_address('server')
+        kacls_host = self.get_service_address('kacls')
+        
+        if not server_host or not kacls_host:
+            self.logger.error("Required services not discovered")
+            return None
+            
         # 從Server獲取訊息
         get_request = {
             'type': 'get_message',
@@ -221,7 +396,7 @@ class CSEClient:
             'b_jwt': b_jwt
         }
         
-        get_response = NetworkUtils.send_tcp_message(self.server_host, self.server_port, get_request)
+        get_response = NetworkUtils.send_tcp_message(server_host, self.server_port, get_request)
         
         if get_response.get('status') != 'success':
             self.logger.error(f"Failed to get message: {get_response.get('message')}")
@@ -264,7 +439,8 @@ class CSEClient:
     def _start_message_checker(self):
         """啟動訊息檢查線程"""
         def check_messages():
-            while self.is_authenticated:
+            server_host = self.get_service_address('server')
+            while self.is_authenticated and server_host:
                 try:
                     request = {
                         'type': 'check_messages',
@@ -272,7 +448,7 @@ class CSEClient:
                     }
                     
                     response = NetworkUtils.send_tcp_message(
-                        self.server_host, 
+                        server_host, 
                         self.server_port, 
                         request
                     )
@@ -302,7 +478,7 @@ class CSEClient:
                                         'client_id': self.client_id,
                                         'group_id': group_id
                                     }
-                                    response = NetworkUtils.send_tcp_message(self.server_host, self.server_port, request)
+                                    response = NetworkUtils.send_tcp_message(server_host, self.server_port, request)
                                     
                                     if response.get('status') == 'success':
                                         group_info = response.get('group')
@@ -326,7 +502,7 @@ class CSEClient:
         self.message_check_thread.daemon = True
         self.message_check_thread.start()
 
-    def read_pending_messages(self, kacls_host):
+    def read_pending_messages(self):
         """讀取所有待處理的訊息"""
         with self.message_lock:
             pending = self.new_messages.copy()
@@ -339,6 +515,10 @@ class CSEClient:
         print(f"\n📬 You have {len(pending)} new message(s):")
         
         for msg_info in pending:
+            if msg_info.get('type') == 'group_invite':
+                # 群組邀請已經在message checker中處理
+                continue
+                
             if msg_info.get('group_name'):
                 print(f"\n--- Group message in '{msg_info['group_name']}' from {msg_info['from']} ---")
             else:
@@ -348,8 +528,7 @@ class CSEClient:
             # 自動接收並解密訊息
             decrypted = self.receive_message(
                 msg_info['message_id'], 
-                msg_info['b_jwt'], 
-                kacls_host
+                msg_info['b_jwt']
             )
             
             if decrypted:
@@ -359,16 +538,25 @@ class CSEClient:
             print("-" * 40)
 
 def main():
-    if len(sys.argv) < 3:
-        print("Usage: python client.py <client_id> <server_host> [idp_host] [kacls_host]")
+    if len(sys.argv) < 2:
+        print("Usage: python client.py <client_id>")
         sys.exit(1)
     
     client_id = sys.argv[1]
-    server_host = sys.argv[2]
-    idp_host = sys.argv[3] if len(sys.argv) > 3 else server_host
-    kacls_host = sys.argv[4] if len(sys.argv) > 4 else server_host
+    client = CSEClient(client_id)
     
-    client = CSEClient(client_id, server_host)
+    # 服務發現階段
+    print("🔍 Starting service discovery...")
+    passphrase = input("Enter passphrase to join the service: ")
+    
+    if not client.discover_services(passphrase):
+        print("❌ Failed to discover services. Please check the passphrase and try again.")
+        sys.exit(1)
+    
+    print("✅ Services discovered successfully!")
+    print(f"   Server: {client.get_service_address('server')}")
+    print(f"   IdP: {client.get_service_address('idp')}")
+    print(f"   KACLS: {client.get_service_address('kacls')}")
     
     # 互動式命令行界面
     while True:
@@ -380,11 +568,11 @@ def main():
             
             if choice == '1':
                 password = getpass.getpass("Enter password: ")
-                if client.register(idp_host, password):
+                if client.register(password):
                     print("Registration successful! Please login.")
             elif choice == '2':
                 password = getpass.getpass("Enter password: ")
-                if client.authenticate(idp_host, password):
+                if client.authenticate(password):
                     print("Login successful!")
             elif choice == '3':
                 break
@@ -404,7 +592,7 @@ def main():
             elif choice == '2':
                 receiver = input("Enter receiver ID: ").strip()
                 message = input("Enter message: ")
-                if client.send_message(receiver, message, kacls_host):
+                if client.send_message(receiver, message):
                     print("Message sent successfully!")
                 else:
                     print("Failed to send message.")
@@ -420,14 +608,14 @@ def main():
                     group_id = input("Enter group ID: ").strip()
                     if group_id in client.groups:
                         message = input("Enter message: ")
-                        if client.send_message(group_id, message, kacls_host, is_group=True):
+                        if client.send_message(group_id, message, is_group=True):
                             print("Group message sent successfully!")
                         else:
                             print("Failed to send group message.")
                     else:
                         print("Invalid group ID.")
             elif choice == '4':
-                client.read_pending_messages(kacls_host)
+                client.read_pending_messages()
             elif choice == '5':
                 group_name = input("Enter group name: ").strip()
                 members_input = input("Enter member IDs (comma-separated, you are included by default): ").strip()
