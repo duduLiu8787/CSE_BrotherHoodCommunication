@@ -163,6 +163,8 @@ class CSEServer:
                 return self._handle_check_messages(request)
             elif request_type == 'verify_jwt':
                 return self._handle_verify_jwt(request)
+            elif request_type == 'claim_message':
+                return self._handle_claim_message(request, client_addr)
             elif request_type == 'heartbeat':
                 return self._handle_heartbeat(request, client_addr)
             elif request_type == 'create_group':
@@ -469,53 +471,45 @@ class CSEServer:
             if sender_id not in group_info['members']:
                 return {'status': 'error', 'message': 'Sender not a member of this group'}
             
-            # 為每個群組成員創建訊息
+            # 生成單一群組訊息ID
+            message_id = f"group_{group_id}_{sender_id}_{datetime.utcnow().timestamp()}"
+
+            # 儲存單一訊息副本
+            with self.message_lock:
+                self.messages[message_id] = {
+                    'from': sender_id,
+                    'group_id': group_id,
+                    'group_name': group_info['name'],
+                    'data': encrypted_data,
+                    'w_dek': w_dek,
+                    'timestamp': datetime.utcnow().isoformat(),
+                    'is_group': True,
+                    'recipients': group_info['members']
+                }
+
+            # 通知所有群組成員（不包含發送者）
             for member_id in group_info['members']:
-                if member_id == sender_id:  # 跳過發送者自己
+                if member_id == sender_id:
                     continue
                 
-                if member_id not in self.online_clients:  # 跳過離線成員
+                if member_id not in self.online_clients:
                     continue
                 
-                # 生成訊息ID
-                message_id = f"group_{group_id}_{sender_id}_{member_id}_{datetime.utcnow().timestamp()}"
-                
-                # 創建B_JWT
-                b_jwt = JWTUtils.create_b_jwt(
-                    member_id,
-                    message_id,
-                    ['read'],
-                    self.private_key
-                )
-                
-                # 儲存訊息
-                with self.message_lock:
-                    self.messages[message_id] = {
-                        'from': sender_id,
-                        'to': member_id,
-                        'group_id': group_id,
-                        'group_name': group_info['name'],
-                        'data': encrypted_data,
-                        'w_dek': w_dek,
-                        'timestamp': datetime.utcnow().isoformat(),
-                        'read': False
-                    }
-                
-                # 將新訊息加入接收者的待處理列表
+                # 只通知，不生成 B_JWT
                 with self.client_lock:
                     if 'pending_messages' not in self.online_clients[member_id]:
                         self.online_clients[member_id]['pending_messages'] = []
                     
                     self.online_clients[member_id]['pending_messages'].append({
-                        'message_id': message_id,
+                        'message_id': message_id,  # 使用相同的 message_id
                         'from': sender_id,
                         'group_id': group_id,
                         'group_name': group_info['name'],
-                        'b_jwt': b_jwt,
-                        'timestamp': datetime.utcnow().isoformat()
+                        'timestamp': datetime.utcnow().isoformat(),
+                        'requires_authentication': True
                     })
-                
-                self.logger.info(f"Group message {message_id} stored for {member_id}")
+
+            self.logger.info(f"Group message {message_id} stored for group {group_id}")
         
         return {
             'status': 'success',
@@ -560,6 +554,7 @@ class CSEServer:
             }
         
         # 將新訊息加入接收者的待處理列表
+        # 將新訊息加入接收者的待處理列表（不生成 B_JWT）
         with self.client_lock:
             if 'pending_messages' not in self.online_clients[receiver_id]:
                 self.online_clients[receiver_id]['pending_messages'] = []
@@ -567,8 +562,8 @@ class CSEServer:
             self.online_clients[receiver_id]['pending_messages'].append({
                 'message_id': message_id,
                 'from': sender_id,
-                'b_jwt': b_jwt,
-                'timestamp': datetime.utcnow().isoformat()
+                'timestamp': datetime.utcnow().isoformat(),
+                'requires_authentication': True
             })
         
         self.logger.info(f"Message {message_id} stored for {receiver_id}")
@@ -578,7 +573,66 @@ class CSEServer:
             'message_id': message_id,
             'b_jwt': b_jwt
         }
-    
+
+    def _handle_claim_message(self, request, client_addr):
+        """處理訊息認領請求（包含挑戰驗證）"""
+        client_id = request.get('client_id')
+        message_id = request.get('message_id')
+        challenge_response = request.get('challenge_response')
+        
+        # 初始化挑戰字典
+        if not hasattr(self, 'challenges'):
+            self.challenges = {}
+        
+        # 步驟1：如果沒有挑戰響應，發送挑戰
+        if not challenge_response:
+            challenge = os.urandom(32)
+            challenge_key = f"{client_id}_{message_id}"
+            self.challenges[challenge_key] = base64.b64encode(challenge).decode('utf-8')
+            
+            return {
+                'status': 'challenge',
+                'challenge': self.challenges[challenge_key]
+            }
+        
+        # 步驟2：驗證挑戰響應
+        challenge_key = f"{client_id}_{message_id}"
+        stored_challenge = self.challenges.get(challenge_key)
+        if not stored_challenge or challenge_response != stored_challenge:
+            return {'status': 'error', 'message': 'Challenge verification failed'}
+        
+        # 清除挑戰
+        del self.challenges[challenge_key]
+        
+        # 步驟3：檢查訊息權限
+        with self.message_lock:
+            message = self.messages.get(message_id)
+            if not message:
+                return {'status': 'error', 'message': 'Message not found'}
+            
+            # 檢查接收權限
+            if message.get('is_group'):
+                if client_id not in message.get('recipients', []):
+                    return {'status': 'error', 'message': 'Not authorized'}
+            else:
+                if message.get('to') != client_id:
+                    return {'status': 'error', 'message': 'Not authorized'}
+        
+        # 步驟4：生成 B_JWT
+        b_jwt = JWTUtils.create_b_jwt(
+            client_id,
+            message_id,
+            ['read'],
+            self.private_key
+        )
+        
+        self.logger.info(f"Message {message_id} claimed by {client_id} after challenge")
+        
+        return {
+            'status': 'success',
+            'b_jwt': b_jwt
+        }
+
     def _handle_get_message(self, request, client_addr):
         """處理獲取訊息請求"""
         client_id = request.get('client_id')
@@ -600,8 +654,20 @@ class CSEServer:
             if not message:
                 return {'status': 'error', 'message': 'Message not found'}
             
-            if message['to'] != client_id:
-                return {'status': 'error', 'message': 'Access denied'}
+            # -------- 權限檢查 --------
+            if message.get('is_group', False):
+                # 群組訊息：確認 client_id 是該群組成員
+                group_id = message.get('group_id')
+                with self.group_lock:
+                    if (group_id not in self.groups
+                            or client_id not in self.groups[group_id]['members']):
+                        return {'status': 'error', 'message': 'Access denied'}
+            else:
+                # 點對點訊息：確認收件人正確
+                if message.get('to') != client_id:
+                    return {'status': 'error', 'message': 'Access denied'}
+            
+
         
         response_data = {
             'status': 'success',

@@ -345,13 +345,27 @@ class CSEClient:
         encrypted_message = CryptoUtils.encrypt_aes_gcm(dek, message)
         
         # 向KACLS請求包裝DEK
-        wrap_request = {
-            'type': 'wrap_dek',
-            '3p_jwt': self.three_p_jwt,
-            'dek': base64.b64encode(dek).decode('utf-8'),
-            'client_id': self.client_id
-        }
-        
+        if is_group:
+            # 群組訊息：包含所有成員
+            group_members = self.groups.get(receiver_id, {}).get('members', [])
+            wrap_request = {
+                'type': 'wrap_dek',
+                '3p_jwt': self.three_p_jwt,
+                'dek': base64.b64encode(dek).decode('utf-8'),
+                'client_id': self.client_id,
+                'receivers': group_members,
+                'is_group': True,
+                'group_id': receiver_id
+            }
+        else:
+            # 個人訊息：單一接收者
+            wrap_request = {
+                'type': 'wrap_dek',
+                '3p_jwt': self.three_p_jwt,
+                'dek': base64.b64encode(dek).decode('utf-8'),
+                'client_id': self.client_id,
+                'receivers': [receiver_id]
+            }
         wrap_response = NetworkUtils.send_tcp_message(kacls_host, self.kacls_port, wrap_request)
         
         if wrap_response.get('status') != 'success':
@@ -525,16 +539,35 @@ class CSEClient:
                 print(f"\n--- Message from {msg_info['from']} ---")
             print(f"Time: {msg_info['timestamp']}")
             
-            # 自動接收並解密訊息
-            decrypted = self.receive_message(
-                msg_info['message_id'], 
-                msg_info['b_jwt']
-            )
-            
-            if decrypted:
-                print(f"Message: {decrypted['message']}")
+            # 先認領訊息（包含挑戰驗證）
+            server_host = self.get_service_address('server')
+            claim_request = {
+                'type': 'claim_message',
+                'client_id': self.client_id,
+                'message_id': msg_info['message_id']
+            }
+
+            # 發送認領請求
+            response = NetworkUtils.send_tcp_message(server_host, self.server_port, claim_request)
+
+            # 處理挑戰
+            if response.get('status') == 'challenge':
+                challenge = response.get('challenge')
+                claim_request['challenge_response'] = challenge
+                response = NetworkUtils.send_tcp_message(server_host, self.server_port, claim_request)
+
+            if response.get('status') == 'success':
+                b_jwt = response.get('b_jwt')
+                
+                # 使用 B_JWT 接收並解密訊息
+                decrypted = self.receive_message(msg_info['message_id'], b_jwt)
+                
+                if decrypted:
+                    print(f"Message: {decrypted['message']}")
+                else:
+                    print("Failed to decrypt message.")
             else:
-                print("Failed to decrypt message.")
+                print(f"Failed to claim message: {response.get('message')}")
             print("-" * 40)
 
 def main():
