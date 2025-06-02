@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 CSE Communication System - IdP (Identity Provider) Component
-負責管理用戶身份、註冊和驗證
+負責管理用戶身份、註冊和驗證 - 加密通訊版本
 """
 
 import sys
@@ -17,11 +17,11 @@ class CSEIdP:
         self.logger = setup_logger('CSEIdP', 'idp.log')
         self.registry = ServiceRegistry()
         self.private_key, self.public_key = CryptoUtils.generate_rsa_keypair()
-        self.registered_clients = {}  # {client_id: {'password_hash': hash, 'registered_at': timestamp}}
+        self.registered_clients = {}  # {client_id: {'password_salt': salt, 'password_hash': hash, 'public_key': key, 'registered_at': timestamp}}
         self.client_lock = threading.Lock()
-        self.has_responded_to_server = False  # 新增標記
+        self.has_responded_to_server = False
         
-        self.logger.info("IdP initialized")
+        self.logger.info("IdP initialized with encryption support")
     
     def start(self):
         """啟動IdP服務"""
@@ -43,7 +43,7 @@ class CSEIdP:
         NetworkUtils.listen_broadcast(self.passphrase, handle_broadcast)
     
     def _respond_to_server(self, server_addr, server_message):
-        """響應Server的廣播"""
+        """響應Server的廣播 - 加密版本"""
         # 如果已經響應過，就不再響應
         if self.has_responded_to_server:
             return
@@ -55,20 +55,21 @@ class CSEIdP:
         server_public_key = CryptoUtils.deserialize_public_key(server_message.get('public_key'))
         self.registry.register_service('server', server_addr, server_public_key)
         
-        # 發送響應
+        # 發送加密響應
         response = {
             'type': 'service_response',
             'role': 'idp',
-            'passphrase': self.passphrase,  # 明文通關密語驗證
             'public_key': CryptoUtils.serialize_public_key(self.public_key)
         }
         
-        # 直接發送TCP響應給Server
+        # 使用Server的公鑰加密並簽名
         try:
             result = NetworkUtils.send_tcp_message(
                 server_addr,
                 server_message.get('port'),
-                response
+                response,
+                encrypt_with_public_key=server_public_key,
+                sign_with_private_key=self.private_key
             )
             if result and result.get('status') == 'success':
                 self.has_responded_to_server = True
@@ -87,10 +88,12 @@ class CSEIdP:
             self.logger.error(f"Failed to respond to server: {e}")
     
     def _start_tcp_service(self):
-        """啟動TCP服務"""
+        """啟動TCP服務 - 加密版本"""
         NetworkUtils.start_tcp_server(
             NetworkUtils.SERVICE_PORTS['idp'],
-            self._handle_request
+            self._handle_request,
+            self.private_key,
+            self.registry
         )
     
     def _handle_request(self, request, client_addr):
@@ -111,9 +114,10 @@ class CSEIdP:
             return {'status': 'error', 'message': 'Unknown request type'}
     
     def _handle_registration(self, request):
-        """處理客戶端註冊"""
+        """處理客戶端註冊 - 安全版本"""
         client_id = request.get('client_id')
         password = request.get('password')
+        client_public_key = request.get('client_public_key')
         
         if not client_id or not password:
             return {'status': 'error', 'message': 'Missing client_id or password'}
@@ -122,13 +126,13 @@ class CSEIdP:
             if client_id in self.registered_clients:
                 return {'status': 'error', 'message': 'Client already registered'}
             
-            # 儲存客戶端資訊（實際應用中應該使用更安全的密碼儲存方式）
-            password_hash = base64.b64encode(
-                CryptoUtils.derive_key_from_passphrase(password, salt=client_id.encode())
-            ).decode('utf-8')
+            # 安全地儲存密碼
+            salt, password_hash = SecurePasswordHandler.hash_password(password)
             
             self.registered_clients[client_id] = {
-                'password_hash': password_hash,
+                'password_salt': base64.b64encode(salt).decode('utf-8'),
+                'password_hash': base64.b64encode(password_hash).decode('utf-8'),
+                'public_key': client_public_key,
                 'registered_at': datetime.utcnow().isoformat()
             }
         
@@ -144,7 +148,7 @@ class CSEIdP:
         }
     
     def _handle_authentication(self, request):
-        """處理客戶端認證"""
+        """處理客戶端認證 - 安全版本"""
         client_id = request.get('client_id')
         password = request.get('password')
         
@@ -157,11 +161,10 @@ class CSEIdP:
                 return {'status': 'error', 'message': 'Client not registered'}
             
             # 驗證密碼
-            password_hash = base64.b64encode(
-                CryptoUtils.derive_key_from_passphrase(password, salt=client_id.encode())
-            ).decode('utf-8')
+            salt = base64.b64decode(client_info['password_salt'])
+            stored_hash = base64.b64decode(client_info['password_hash'])
             
-            if password_hash != client_info['password_hash']:
+            if not SecurePasswordHandler.verify_password(password, salt, stored_hash):
                 return {'status': 'error', 'message': 'Invalid credentials'}
         
         # 創建新的3P_JWT
@@ -210,6 +213,7 @@ class CSEIdP:
                         return {'status': 'success', 'valid': True, 'payload': payload}
         
         return {'status': 'success', 'valid': False}
+    
     def _handle_update_services(self, request):
         """處理服務更新請求"""
         services = request.get('services', {})

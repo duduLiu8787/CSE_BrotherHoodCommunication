@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 CSE Communication System - Server Component
-負責轉送加密內容、驗證權限、管理在線成員、管理群組
+負責轉送加密內容、驗證權限、管理在線成員、管理群組 - 加密通訊版本
 """
 
 import sys
@@ -17,19 +17,19 @@ class CSEServer:
         self.logger = setup_logger('CSEServer', 'server.log')
         self.registry = ServiceRegistry()
         self.private_key, self.public_key = CryptoUtils.generate_rsa_keypair()
-        self.online_clients = {}  # {client_id: {'address': addr, 'last_seen': timestamp}}
+        self.online_clients = {}  # {client_id: {'address': addr, 'last_seen': timestamp, 'public_key': key}}
         self.messages = {}  # {message_id: {'from': sender, 'to': receiver, 'data': encrypted_data, 'w_dek': w_dek}}
         self.groups = {}  # {group_id: {'name': name, 'members': [client_ids], 'created_by': client_id}}
         self.client_lock = threading.Lock()
         self.message_lock = threading.Lock()
         self.group_lock = threading.Lock()
         self.is_broadcasting = True
-        self.continue_broadcast_for_clients = True  # 新增：控制是否為客戶端繼續廣播
+        self.continue_broadcast_for_clients = True
         
         # Server 自己不需要註冊到 registry，但需要記錄需要的服務
         self.required_services = {'idp', 'kacls'}
         
-        self.logger.info("Server initialized")
+        self.logger.info("Server initialized with encryption support")
     
     def _are_all_services_registered(self):
         """檢查是否所有必需的服務都已註冊"""
@@ -52,15 +52,14 @@ class CSEServer:
         broadcast_thread.daemon = True
         broadcast_thread.start()
         
-        # 啟動廣播監聽線程（保留但可能不會收到訊息）
+        # 啟動廣播監聽線程
         listen_thread = threading.Thread(target=self._listen_for_services)
         listen_thread.daemon = True
         listen_thread.start()
         
-        # 等待所有服務註冊完成，增加調試訊息
+        # 等待所有服務註冊完成
         self.logger.info("Waiting for all services to register...")
         while not self._are_all_services_registered():
-            # 每5秒輸出一次當前註冊狀態
             with self.registry.lock:
                 registered = list(self.registry.services.keys())
             self.logger.debug(f"Currently registered services: {registered}")
@@ -115,28 +114,28 @@ class CSEServer:
                 }
                 NetworkUtils.send_broadcast(message, self.passphrase)
                 self.logger.debug("Broadcasted for client discovery")
-            time.sleep(5)  # 每5秒廣播一次
+            time.sleep(5)
     
     def _listen_for_services(self):
-        """監聽其他服務的響應（目前服務是透過TCP響應，所以這個方法可能不會收到訊息）"""
+        """監聽其他服務的響應"""
         def handle_broadcast(message, addr):
-            # 這個方法保留但可能不會被使用，因為服務現在是透過TCP響應
             if message.get('type') == 'service_response':
                 role = message.get('role')
                 if role in ['idp', 'kacls']:
-                    # 驗證通關密語
-                    if message.get('passphrase') == self.passphrase:
-                        public_key = CryptoUtils.deserialize_public_key(message.get('public_key'))
-                        self.registry.register_service(role, addr, public_key)
-                        self.logger.info(f"Registered {role} service from {addr} via broadcast")
+                    # 不需要驗證明文密語，能解密就表示密語正確
+                    public_key = CryptoUtils.deserialize_public_key(message.get('public_key'))
+                    self.registry.register_service(role, addr, public_key)
+                    self.logger.info(f"Registered {role} service from {addr} via broadcast")
         
         NetworkUtils.listen_broadcast(self.passphrase, handle_broadcast)
     
     def _start_tcp_service(self):
-        """啟動TCP服務"""
+        """啟動TCP服務 - 加密版本"""
         NetworkUtils.start_tcp_server(
             NetworkUtils.SERVICE_PORTS['server'],
-            self._handle_client_request
+            self._handle_client_request,
+            self.private_key,
+            self.registry
         )
     
     def _handle_client_request(self, request, client_addr):
@@ -184,58 +183,9 @@ class CSEServer:
     def _handle_client_discovery(self, request, client_addr):
         """處理客戶端發現請求"""
         client_id = request.get('client_id')
-        passphrase = request.get('passphrase')
+        client_public_key = request.get('public_key')
         
-        # 驗證通關密語
-        if passphrase != self.passphrase:
-            self.logger.warning(f"Client {client_id} provided incorrect passphrase")
-            return {'status': 'error', 'message': 'Invalid passphrase'}
-        
-        # 檢查所有服務是否都已註冊
-        if not self._are_all_services_registered():
-            self.logger.warning(f"Client {client_id} tried to connect before all services are ready")
-            return {'status': 'error', 'message': 'Services not ready'}
-        
-        # 準備服務信息
-        services_info = {}
-        
-        # 添加IdP信息
-        idp_addr = self.registry.get_service('idp')
-        if idp_addr:
-            services_info['idp'] = {
-                'address': idp_addr,
-                'public_key': CryptoUtils.serialize_public_key(self.registry.get_public_key('idp'))
-            }
-        
-        # 添加KACLS信息
-        kacls_addr = self.registry.get_service('kacls')
-        if kacls_addr:
-            services_info['kacls'] = {
-                'address': kacls_addr,
-                'public_key': CryptoUtils.serialize_public_key(self.registry.get_public_key('kacls'))
-            }
-        
-        self.logger.info(f"Client {client_id} discovered services successfully")
-        
-        return {
-            'status': 'success',
-            'message': 'Services discovered',
-            'services': services_info
-        }
-    
-    def _are_all_services_registered(self):
-        """檢查是否所有必需的服務都已註冊"""
-        with self.registry.lock:
-            registered = set(self.registry.services.keys())
-            return self.required_services.issubset(registered)
-        """處理客戶端發現請求"""
-        client_id = request.get('client_id')
-        passphrase = request.get('passphrase')
-        
-        # 驗證通關密語
-        if passphrase != self.passphrase:
-            self.logger.warning(f"Client {client_id} provided incorrect passphrase")
-            return {'status': 'error', 'message': 'Invalid passphrase'}
+        # 能夠解密請求就表示通關密語正確
         
         # 檢查所有服務是否都已註冊
         if not self._are_all_services_registered():
@@ -270,47 +220,44 @@ class CSEServer:
         }
     
     def _handle_service_response(self, request, client_addr):
-        """處理服務響應"""
+        """處理服務響應 - 加密版本"""
         role = request.get('role')
         self.logger.debug(f"Received service response from {client_addr}, role: {role}")
         
         if role in ['idp', 'kacls']:
-            # 驗證通關密語
-            if request.get('passphrase') == self.passphrase:
-                public_key = CryptoUtils.deserialize_public_key(request.get('public_key'))
-                self.registry.register_service(role, client_addr, public_key)
-                self.logger.info(f"Registered {role} service from {client_addr}")
-                
-                # 檢查並輸出當前註冊狀態
-                with self.registry.lock:
-                    current_services = list(self.registry.services.keys())
-                self.logger.info(f"Current registered services: {current_services}")
-                self.logger.info(f"All services registered: {self._are_all_services_registered()}")
-                
-                # 回傳其他服務的資訊
-                other_services = {}
-                if role == 'idp' and self.registry.get_service('kacls'):
-                    other_services['kacls'] = {
-                        'address': self.registry.get_service('kacls'),
-                        'public_key': CryptoUtils.serialize_public_key(self.registry.get_public_key('kacls'))
-                    }
-                elif role == 'kacls' and self.registry.get_service('idp'):
-                    other_services['idp'] = {
-                        'address': self.registry.get_service('idp'),
-                        'public_key': CryptoUtils.serialize_public_key(self.registry.get_public_key('idp'))
-                    }
-                
-                if self._are_all_services_registered():
-                    self.logger.info("All services now registered, will notify others")
-                    self._notify_services_update()
-                    
-                return {
-                    'status': 'success', 
-                    'message': f'{role} registered successfully',
-                    'other_services': other_services
+            # 能夠解密就表示通關密語正確
+            public_key = CryptoUtils.deserialize_public_key(request.get('public_key'))
+            self.registry.register_service(role, client_addr, public_key)
+            self.logger.info(f"Registered {role} service from {client_addr}")
+            
+            # 檢查並輸出當前註冊狀態
+            with self.registry.lock:
+                current_services = list(self.registry.services.keys())
+            self.logger.info(f"Current registered services: {current_services}")
+            self.logger.info(f"All services registered: {self._are_all_services_registered()}")
+            
+            # 回傳其他服務的資訊
+            other_services = {}
+            if role == 'idp' and self.registry.get_service('kacls'):
+                other_services['kacls'] = {
+                    'address': self.registry.get_service('kacls'),
+                    'public_key': CryptoUtils.serialize_public_key(self.registry.get_public_key('kacls'))
                 }
-            else:
-                self.logger.warning(f"Invalid passphrase from {role} at {client_addr}")
+            elif role == 'kacls' and self.registry.get_service('idp'):
+                other_services['idp'] = {
+                    'address': self.registry.get_service('idp'),
+                    'public_key': CryptoUtils.serialize_public_key(self.registry.get_public_key('idp'))
+                }
+            
+            if self._are_all_services_registered():
+                self.logger.info("All services now registered, will notify others")
+                self._notify_services_update()
+                
+            return {
+                'status': 'success', 
+                'message': f'{role} registered successfully',
+                'other_services': other_services
+            }
         else:
             self.logger.warning(f"Unknown service role: {role}")
             
@@ -337,13 +284,14 @@ class CSEServer:
     def _handle_client_registration(self, request, client_addr):
         """處理客戶端註冊"""
         client_id = request.get('client_id')
+        client_public_key = request.get('public_key')
         
         # 驗證客戶端是否已在IdP註冊
         idp_addr = self.registry.get_service('idp')
         if not idp_addr:
             return {'status': 'error', 'message': 'IdP service not available'}
         
-        # 向IdP驗證客戶端
+        # 向IdP驗證客戶端 - 使用加密通道
         verify_request = {
             'type': 'verify_client',
             'client_id': client_id,
@@ -353,7 +301,9 @@ class CSEServer:
         idp_response = NetworkUtils.send_tcp_message(
             idp_addr,
             NetworkUtils.SERVICE_PORTS['idp'],
-            verify_request
+            verify_request,
+            encrypt_with_public_key=self.registry.get_public_key('idp'),
+            sign_with_private_key=self.private_key
         )
         
         if idp_response.get('status') == 'success':
@@ -361,7 +311,8 @@ class CSEServer:
                 self.online_clients[client_id] = {
                     'address': client_addr,
                     'last_seen': datetime.utcnow().isoformat(),
-                    'pending_messages': []
+                    'pending_messages': [],
+                    'public_key': CryptoUtils.deserialize_public_key(client_public_key) if client_public_key else None
                 }
             self.logger.info(f"Client {client_id} registered from {client_addr}")
             return {'status': 'success', 'message': 'Client registered successfully'}
@@ -395,6 +346,7 @@ class CSEServer:
             }
         
         self.logger.info(f"Group '{group_name}' (ID: {group_id}) created by {client_id}")
+        
         # 通知所有成員（除了創建者）
         for member_id in members:
             if member_id != client_id and member_id in self.online_clients:
@@ -554,7 +506,6 @@ class CSEServer:
             }
         
         # 將新訊息加入接收者的待處理列表
-        # 將新訊息加入接收者的待處理列表（不生成 B_JWT）
         with self.client_lock:
             if 'pending_messages' not in self.online_clients[receiver_id]:
                 self.online_clients[receiver_id]['pending_messages'] = []
@@ -654,7 +605,7 @@ class CSEServer:
             if not message:
                 return {'status': 'error', 'message': 'Message not found'}
             
-            # -------- 權限檢查 --------
+            # 權限檢查
             if message.get('is_group', False):
                 # 群組訊息：確認 client_id 是該群組成員
                 group_id = message.get('group_id')
@@ -666,8 +617,6 @@ class CSEServer:
                 # 點對點訊息：確認收件人正確
                 if message.get('to') != client_id:
                     return {'status': 'error', 'message': 'Access denied'}
-            
-
         
         response_data = {
             'status': 'success',
@@ -755,7 +704,9 @@ class CSEServer:
                 NetworkUtils.send_tcp_message(
                     idp_addr,
                     NetworkUtils.SERVICE_PORTS['idp'],
-                    update_request
+                    update_request,
+                    encrypt_with_public_key=self.registry.get_public_key('idp'),
+                    sign_with_private_key=self.private_key
                 )
                 self.logger.info("Notified IdP about KACLS service")
             except Exception as e:
@@ -777,7 +728,9 @@ class CSEServer:
                 NetworkUtils.send_tcp_message(
                     kacls_addr,
                     NetworkUtils.SERVICE_PORTS['kacls'],
-                    update_request
+                    update_request,
+                    encrypt_with_public_key=self.registry.get_public_key('kacls'),
+                    sign_with_private_key=self.private_key
                 )
                 self.logger.info("Notified KACLS about IdP service")
             except Exception as e:

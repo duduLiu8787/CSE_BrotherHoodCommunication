@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 CSE Communication System - GUI Client Component
-圖形化客戶端應用程式 - 即時更新版本
+圖形化客戶端應用程式 - 加密通訊版本
 """
 
 import tkinter as tk
@@ -19,6 +19,9 @@ class CSEClientGUI:
     def __init__(self, client_id):
         self.client_id = client_id
         self.logger = setup_logger(f'CSEClientGUI_{client_id}', f'client_gui_{client_id}.log')
+        
+        # 加密相關
+        self.client_private_key, self.client_public_key = CryptoUtils.generate_rsa_keypair()
         
         # 核心屬性
         self.three_p_jwt = None
@@ -56,7 +59,7 @@ class CSEClientGUI:
         # 啟動訊息處理線程
         self.root.after(100, self.process_message_queue)
         
-        self.logger.info(f"Client GUI {client_id} initialized")
+        self.logger.info(f"Client GUI {client_id} initialized with encryption support")
     
     def setup_ui(self):
         """設定使用者介面"""
@@ -128,6 +131,7 @@ class CSEClientGUI:
         self.logout_btn = ttk.Button(auth_frame, text="登出", command=self.logout, state='disabled')
         self.logout_btn.grid(row=1, column=2, padx=5, pady=5)
     
+    # ... [其餘 UI setup 方法保持不變] ...
     def setup_chat_tab(self):
         """設定聊天分頁"""
         # 左側：在線使用者列表
@@ -864,23 +868,28 @@ class CSEClientGUI:
         self.logger.info("Stopped listening for server broadcasts")
     
     def _respond_to_server(self, server_addr, server_message, passphrase):
-        """響應服務器廣播並獲取所有服務信息"""
+        """響應服務器廣播並獲取所有服務信息 - 加密版本"""
         if self.service_discovered.is_set():
             return
             
         time.sleep(0.5)
         
+        server_public_key = CryptoUtils.deserialize_public_key(server_message.get('public_key'))
+        
         response = {
             'type': 'client_discovery',
             'client_id': self.client_id,
-            'passphrase': passphrase
+            'public_key': CryptoUtils.serialize_public_key(self.client_public_key)
         }
         
         try:
+            # 使用加密通道
             result = NetworkUtils.send_tcp_message(
                 server_addr,
                 server_message.get('port'),
-                response
+                response,
+                encrypt_with_public_key=server_public_key,
+                sign_with_private_key=self.client_private_key
             )
             
             if result and result.get('status') == 'success':
@@ -888,7 +897,7 @@ class CSEClientGUI:
                 
                 self.services['server'] = {
                     'address': server_addr,
-                    'public_key': CryptoUtils.deserialize_public_key(server_message.get('public_key'))
+                    'public_key': server_public_key
                 }
                 
                 for role, info in services_info.items():
@@ -915,7 +924,7 @@ class CSEClientGUI:
         return None
     
     def register(self, password):
-        """向IdP註冊"""
+        """向IdP註冊 - 加密版本"""
         idp_host = self.get_service_address('idp')
         if not idp_host:
             self.logger.error("IdP service not discovered")
@@ -924,10 +933,18 @@ class CSEClientGUI:
         request = {
             'type': 'register',
             'client_id': self.client_id,
-            'password': password
+            'password': password,
+            'client_public_key': CryptoUtils.serialize_public_key(self.client_public_key)
         }
         
-        response = NetworkUtils.send_tcp_message(idp_host, self.idp_port, request)
+        # 使用加密通道
+        response = NetworkUtils.send_tcp_message(
+            idp_host, 
+            self.idp_port, 
+            request,
+            encrypt_with_public_key=self.services['idp']['public_key'],
+            sign_with_private_key=self.client_private_key
+        )
         
         if response.get('status') == 'success':
             self.three_p_jwt = response.get('3p_jwt')
@@ -938,7 +955,7 @@ class CSEClientGUI:
             return False
     
     def authenticate(self, password):
-        """向IdP認證"""
+        """向IdP認證 - 加密版本"""
         idp_host = self.get_service_address('idp')
         if not idp_host:
             self.logger.error("IdP service not discovered")
@@ -950,7 +967,14 @@ class CSEClientGUI:
             'password': password
         }
         
-        response = NetworkUtils.send_tcp_message(idp_host, self.idp_port, request)
+        # 使用加密通道
+        response = NetworkUtils.send_tcp_message(
+            idp_host, 
+            self.idp_port, 
+            request,
+            encrypt_with_public_key=self.services['idp']['public_key'],
+            sign_with_private_key=self.client_private_key
+        )
         
         if response.get('status') == 'success':
             self.three_p_jwt = response.get('3p_jwt')
@@ -975,7 +999,7 @@ class CSEClientGUI:
             return False
     
     def _register_with_server(self):
-        """向Server註冊"""
+        """向Server註冊 - 加密版本"""
         server_host = self.get_service_address('server')
         if not server_host:
             self.logger.error("Server service not discovered")
@@ -984,18 +1008,26 @@ class CSEClientGUI:
         request = {
             'type': 'register_client',
             'client_id': self.client_id,
-            '3p_jwt': self.three_p_jwt
+            '3p_jwt': self.three_p_jwt,
+            'public_key': CryptoUtils.serialize_public_key(self.client_public_key)
         }
         
-        response = NetworkUtils.send_tcp_message(server_host, self.server_port, request)
+        # 使用加密通道
+        response = NetworkUtils.send_tcp_message(
+            server_host, 
+            self.server_port, 
+            request,
+            encrypt_with_public_key=self.services['server']['public_key'],
+            sign_with_private_key=self.client_private_key
+        )
         
         if response.get('status') == 'success':
             self.logger.info("Registered with server")
         else:
             self.logger.error(f"Server registration failed: {response.get('message')}")
-    
+
     def _start_heartbeat(self):
-        """啟動心跳線程"""
+        """啟動心跳線程 - 加密版本"""
         def heartbeat():
             server_host = self.get_service_address('server')
             while self.is_authenticated and server_host and not getattr(self, 'stop_all_threads', False):
@@ -1004,7 +1036,13 @@ class CSEClientGUI:
                     'client_id': self.client_id
                 }
                 try:
-                    NetworkUtils.send_tcp_message(server_host, self.server_port, request)
+                    NetworkUtils.send_tcp_message(
+                        server_host, 
+                        self.server_port, 
+                        request,
+                        encrypt_with_public_key=self.services['server']['public_key'],
+                        sign_with_private_key=self.client_private_key
+                    )
                 except Exception as e:
                     self.logger.error(f"Heartbeat failed: {e}")
                 time.sleep(60)
@@ -1014,7 +1052,7 @@ class CSEClientGUI:
         heartbeat_thread.start()
     
     def _start_message_checker(self):
-        """啟動訊息檢查線程"""
+        """啟動訊息檢查線程 - 加密版本"""
         def check_messages():
             server_host = self.get_service_address('server')
             while self.is_authenticated and server_host and not getattr(self, 'stop_all_threads', False):
@@ -1027,7 +1065,9 @@ class CSEClientGUI:
                     response = NetworkUtils.send_tcp_message(
                         server_host, 
                         self.server_port, 
-                        request
+                        request,
+                        encrypt_with_public_key=self.services['server']['public_key'],
+                        sign_with_private_key=self.client_private_key
                     )
                     
                     if response.get('status') == 'success':
@@ -1057,7 +1097,13 @@ class CSEClientGUI:
                                         'client_id': self.client_id,
                                         'group_id': group_id
                                     }
-                                    response = NetworkUtils.send_tcp_message(server_host, self.server_port, request)
+                                    response = NetworkUtils.send_tcp_message(
+                                        server_host, 
+                                        self.server_port, 
+                                        request,
+                                        encrypt_with_public_key=self.services['server']['public_key'],
+                                        sign_with_private_key=self.client_private_key
+                                    )
                                     
                                     if response.get('status') == 'success':
                                         group_info = response.get('group')
@@ -1091,7 +1137,7 @@ class CSEClientGUI:
         message_check_thread.start()
     
     def _process_new_message(self, msg_info):
-        """處理新訊息"""
+        """處理新訊息 - 加密版本"""
         try:
             server_host = self.get_service_address('server')
             if not server_host:
@@ -1104,13 +1150,25 @@ class CSEClientGUI:
                 'message_id': msg_info['message_id']
             }
             
-            response = NetworkUtils.send_tcp_message(server_host, self.server_port, claim_request)
+            response = NetworkUtils.send_tcp_message(
+                server_host, 
+                self.server_port, 
+                claim_request,
+                encrypt_with_public_key=self.services['server']['public_key'],
+                sign_with_private_key=self.client_private_key
+            )
             
             # 處理挑戰
             if response.get('status') == 'challenge':
                 challenge = response.get('challenge')
                 claim_request['challenge_response'] = challenge
-                response = NetworkUtils.send_tcp_message(server_host, self.server_port, claim_request)
+                response = NetworkUtils.send_tcp_message(
+                    server_host, 
+                    self.server_port, 
+                    claim_request,
+                    encrypt_with_public_key=self.services['server']['public_key'],
+                    sign_with_private_key=self.client_private_key
+                )
             
             if response.get('status') == 'success':
                 b_jwt = response.get('b_jwt')
@@ -1143,7 +1201,7 @@ class CSEClientGUI:
             self.logger.error(f"Process new message error: {e}")
     
     def get_online_clients(self):
-        """獲取在線客戶端列表"""
+        """獲取在線客戶端列表 - 加密版本"""
         server_host = self.get_service_address('server')
         if not server_host:
             self.logger.error("Server service not discovered")
@@ -1154,7 +1212,13 @@ class CSEClientGUI:
             'client_id': self.client_id
         }
         
-        response = NetworkUtils.send_tcp_message(server_host, self.server_port, request)
+        response = NetworkUtils.send_tcp_message(
+            server_host, 
+            self.server_port, 
+            request,
+            encrypt_with_public_key=self.services['server']['public_key'],
+            sign_with_private_key=self.client_private_key
+        )
         
         if response.get('status') == 'success':
             return response.get('online_clients', [])
@@ -1163,7 +1227,7 @@ class CSEClientGUI:
             return []
     
     def create_group(self, group_name, member_ids):
-        """創建群組"""
+        """創建群組 - 加密版本"""
         server_host = self.get_service_address('server')
         if not server_host:
             self.logger.error("Server service not discovered")
@@ -1176,7 +1240,13 @@ class CSEClientGUI:
             'members': member_ids
         }
         
-        response = NetworkUtils.send_tcp_message(server_host, self.server_port, request)
+        response = NetworkUtils.send_tcp_message(
+            server_host, 
+            self.server_port, 
+            request,
+            encrypt_with_public_key=self.services['server']['public_key'],
+            sign_with_private_key=self.client_private_key
+        )
         
         if response.get('status') == 'success':
             group_id = response.get('group_id')
@@ -1189,9 +1259,9 @@ class CSEClientGUI:
         else:
             self.logger.error(f"Failed to create group: {response.get('message')}")
             return False, response.get('message')
-    
+        
     def _get_my_groups(self):
-        """獲取已加入的群組"""
+        """獲取已加入的群組 - 加密版本"""
         server_host = self.get_service_address('server')
         if not server_host:
             return
@@ -1201,16 +1271,22 @@ class CSEClientGUI:
             'client_id': self.client_id
         }
         
-        response = NetworkUtils.send_tcp_message(server_host, self.server_port, request)
+        response = NetworkUtils.send_tcp_message(
+            server_host, 
+            self.server_port, 
+            request,
+            encrypt_with_public_key=self.services['server']['public_key'],
+            sign_with_private_key=self.client_private_key
+        )
         
         if response.get('status') == 'success':
             self.groups = response.get('groups', {})
             self.logger.info(f"Retrieved {len(self.groups)} groups")
         else:
             self.logger.error(f"Failed to get groups: {response.get('message')}")
-    
+
     def send_message_backend(self, receiver_id, message, is_group=False):
-        """發送加密訊息"""
+        """發送加密訊息 - 加密版本"""
         kacls_host = self.get_service_address('kacls')
         server_host = self.get_service_address('server')
         
@@ -1224,7 +1300,7 @@ class CSEClientGUI:
         # 加密訊息
         encrypted_message = CryptoUtils.encrypt_aes_gcm(dek, message)
         
-        # 向KACLS請求包裝DEK
+        # 向KACLS請求包裝DEK - 使用加密通道
         if is_group:
             group_members = self.groups.get(receiver_id, {}).get('members', [])
             wrap_request = {
@@ -1245,7 +1321,13 @@ class CSEClientGUI:
                 'receivers': [receiver_id]
             }
         
-        wrap_response = NetworkUtils.send_tcp_message(kacls_host, self.kacls_port, wrap_request)
+        wrap_response = NetworkUtils.send_tcp_message(
+            kacls_host, 
+            self.kacls_port, 
+            wrap_request,
+            encrypt_with_public_key=self.services['kacls']['public_key'],
+            sign_with_private_key=self.client_private_key
+        )
         
         if wrap_response.get('status') != 'success':
             self.logger.error(f"Failed to wrap DEK: {wrap_response.get('message')}")
@@ -1253,7 +1335,7 @@ class CSEClientGUI:
         
         w_dek = wrap_response.get('w_dek')
         
-        # 發送加密訊息到Server
+        # 發送加密訊息到Server - 使用加密通道
         send_request = {
             'type': 'send_group_message' if is_group else 'send_message',
             'sender_id': self.client_id,
@@ -1262,7 +1344,13 @@ class CSEClientGUI:
             'w_dek': w_dek
         }
         
-        send_response = NetworkUtils.send_tcp_message(server_host, self.server_port, send_request)
+        send_response = NetworkUtils.send_tcp_message(
+            server_host, 
+            self.server_port, 
+            send_request,
+            encrypt_with_public_key=self.services['server']['public_key'],
+            sign_with_private_key=self.client_private_key
+        )
         
         if send_response.get('status') == 'success':
             target_type = "group" if is_group else "user"
@@ -1271,9 +1359,9 @@ class CSEClientGUI:
         else:
             self.logger.error(f"Failed to send message: {send_response.get('message')}")
             return False
-    
+        
     def receive_message(self, message_id, b_jwt):
-        """接收並解密訊息"""
+        """接收並解密訊息 - 加密版本"""
         server_host = self.get_service_address('server')
         kacls_host = self.get_service_address('kacls')
         
@@ -1281,7 +1369,7 @@ class CSEClientGUI:
             self.logger.error("Required services not discovered")
             return None
             
-        # 從Server獲取訊息
+        # 從Server獲取訊息 - 使用加密通道
         get_request = {
             'type': 'get_message',
             'client_id': self.client_id,
@@ -1289,7 +1377,13 @@ class CSEClientGUI:
             'b_jwt': b_jwt
         }
         
-        get_response = NetworkUtils.send_tcp_message(server_host, self.server_port, get_request)
+        get_response = NetworkUtils.send_tcp_message(
+            server_host, 
+            self.server_port, 
+            get_request,
+            encrypt_with_public_key=self.services['server']['public_key'],
+            sign_with_private_key=self.client_private_key
+        )
         
         if get_response.get('status') != 'success':
             self.logger.error(f"Failed to get message: {get_response.get('message')}")
@@ -1297,7 +1391,7 @@ class CSEClientGUI:
         
         message_data = get_response.get('message')
         
-        # 向KACLS請求解包DEK
+        # 向KACLS請求解包DEK - 使用加密通道
         unwrap_request = {
             'type': 'unwrap_dek',
             '3p_jwt': self.three_p_jwt,
@@ -1306,7 +1400,13 @@ class CSEClientGUI:
             'client_id': self.client_id
         }
         
-        unwrap_response = NetworkUtils.send_tcp_message(kacls_host, self.kacls_port, unwrap_request)
+        unwrap_response = NetworkUtils.send_tcp_message(
+            kacls_host, 
+            self.kacls_port, 
+            unwrap_request,
+            encrypt_with_public_key=self.services['kacls']['public_key'],
+            sign_with_private_key=self.client_private_key
+        )
         
         if unwrap_response.get('status') != 'success':
             self.logger.error(f"Failed to unwrap DEK: {unwrap_response.get('message')}")

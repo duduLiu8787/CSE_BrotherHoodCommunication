@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 CSE Communication System - KACLS (Key Access Control Lockdown Service) Component
-負責管理KEK和DEK的加密解密
+負責管理KEK和DEK的加密解密 - 加密通訊版本
 """
 
 import sys
@@ -25,9 +25,9 @@ class CSEKACLS:
         # 用於記錄操作
         self.operation_log = []
         self.log_lock = threading.Lock()
-        self.has_responded_to_server = False  # 新增標記
+        self.has_responded_to_server = False
         
-        self.logger.info("KACLS initialized")
+        self.logger.info("KACLS initialized with encryption support")
     
     def start(self):
         """啟動KACLS服務"""
@@ -49,7 +49,7 @@ class CSEKACLS:
         NetworkUtils.listen_broadcast(self.passphrase, handle_broadcast)
     
     def _respond_to_server(self, server_addr, server_message):
-        """響應Server的廣播"""
+        """響應Server的廣播 - 加密版本"""
         # 如果已經響應過，就不再響應
         if self.has_responded_to_server:
             return
@@ -61,20 +61,21 @@ class CSEKACLS:
         server_public_key = CryptoUtils.deserialize_public_key(server_message.get('public_key'))
         self.registry.register_service('server', server_addr, server_public_key)
         
-        # 發送響應
+        # 發送加密響應
         response = {
             'type': 'service_response',
             'role': 'kacls',
-            'passphrase': self.passphrase,  # 明文通關密語驗證
             'public_key': CryptoUtils.serialize_public_key(self.public_key)
         }
         
-        # 直接發送TCP響應給Server
+        # 使用Server的公鑰加密並簽名
         try:
             result = NetworkUtils.send_tcp_message(
                 server_addr,
                 server_message.get('port'),
-                response
+                response,
+                encrypt_with_public_key=server_public_key,
+                sign_with_private_key=self.private_key
             )
             if result and result.get('status') == 'success':
                 self.has_responded_to_server = True
@@ -92,10 +93,12 @@ class CSEKACLS:
             self.logger.error(f"Failed to respond to server: {e}")
     
     def _start_tcp_service(self):
-        """啟動TCP服務"""
+        """啟動TCP服務 - 加密版本"""
         NetworkUtils.start_tcp_server(
             NetworkUtils.SERVICE_PORTS['kacls'],
-            self._handle_request
+            self._handle_request,
+            self.private_key,
+            self.registry
         )
     
     def _handle_request(self, request, client_addr):
@@ -112,7 +115,7 @@ class CSEKACLS:
             return {'status': 'error', 'message': 'Unknown request type'}
     
     def _verify_tokens(self, three_p_jwt, b_jwt=None):
-        """驗證JWT tokens"""
+        """驗證JWT tokens - 使用加密通道"""
         # 驗證3P_JWT
         idp_addr = self.registry.get_service('idp')
         if not idp_addr:
@@ -124,10 +127,13 @@ class CSEKACLS:
             'token_type': '3P_JWT'
         }
         
+        # 使用加密通道向IdP驗證
         idp_response = NetworkUtils.send_tcp_message(
             idp_addr,
             NetworkUtils.SERVICE_PORTS['idp'],
-            verify_3p_request
+            verify_3p_request,
+            encrypt_with_public_key=self.registry.get_public_key('idp'),
+            sign_with_private_key=self.private_key
         )
         
         if not idp_response.get('valid'):
@@ -145,10 +151,13 @@ class CSEKACLS:
                 'token_type': 'B_JWT'
             }
             
+            # 使用加密通道向Server驗證
             server_response = NetworkUtils.send_tcp_message(
                 server_addr,
                 NetworkUtils.SERVICE_PORTS['server'],
-                verify_b_request
+                verify_b_request,
+                encrypt_with_public_key=self.registry.get_public_key('server'),
+                sign_with_private_key=self.private_key
             )
             
             if not server_response.get('valid'):
@@ -284,6 +293,7 @@ class CSEKACLS:
             self.logger.info(f"Updated {service_role} service at {service_info['address']}")
         
         return {'status': 'success', 'message': 'Services updated'}
+
 def main():
     if len(sys.argv) != 2:
         print("Usage: python kacls.py <passphrase>")
