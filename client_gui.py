@@ -961,42 +961,55 @@ class CSEClientGUI:
             self.logger.error("IdP service not discovered")
             return False
             
-        request = {
+        # 第一步：送出密碼請求，等待挑戰或直接成功
+        first_req = {
             'type': 'authenticate',
             'client_id': self.client_id,
             'password': password
         }
-        
-        # 使用加密通道
-        response = NetworkUtils.send_tcp_message(
-            idp_host, 
-            self.idp_port, 
-            request,
+        first_resp = NetworkUtils.send_tcp_message(
+            idp_host,
+            self.idp_port,
+            first_req,
             encrypt_with_public_key=self.services['idp']['public_key'],
             sign_with_private_key=self.client_private_key
         )
-        
-        if response.get('status') == 'success':
-            self.three_p_jwt = response.get('3p_jwt')
-            self.is_authenticated = True
-            self.logger.info("Authentication successful")
-            
-            # 向Server註冊
-            self._register_with_server()
-            
-            # 獲取已加入的群組
-            self._get_my_groups()
-            
-            # 啟動心跳線程
-            self._start_heartbeat()
-            
-            # 啟動訊息檢查線程
-            self._start_message_checker()
-            
-            return True
-        else:
-            self.logger.error(f"Authentication failed: {response.get('message')}")
-            return False
+
+
+        # 如果收到 challenge，就進行第二步：簽名後回傳
+        if first_resp.get('status') == 'challenge':
+            challenge_b64 = first_resp.get('challenge')
+            # 用私鑰簽名挑戰
+            signature = CryptoUtils.sign_data(self.client_private_key, challenge_b64)
+            second_req = {
+                'type': 'auth_challenge_response',
+                'client_id': self.client_id,
+                'signed_challenge': signature
+            }
+            second_resp = NetworkUtils.send_tcp_message(
+                idp_host,
+                self.idp_port,
+                second_req,
+                encrypt_with_public_key=self.services['idp']['public_key'],
+                sign_with_private_key=self.client_private_key
+            )
+            if second_resp.get('status') == 'success':
+                self.three_p_jwt = second_resp.get('3p_jwt')
+                self.is_authenticated = True
+                self.logger.info("Authentication successful (after challenge)")
+                # 向Server註冊、取得群組並啟動心跳／訊息檢查
+                self._register_with_server()
+                self._get_my_groups()
+                self._start_heartbeat()
+                self._start_message_checker()
+                return True
+            else:
+                self.logger.error(f"Challenge-response failed: {second_resp.get('message')}")
+                return False
+
+        # 其他錯誤狀況
+        self.logger.error(f"Authentication failed: {first_resp.get('message')}")
+        return False
     
     def _register_with_server(self):
         """向Server註冊 - 加密版本"""
