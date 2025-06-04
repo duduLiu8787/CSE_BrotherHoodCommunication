@@ -2,6 +2,7 @@
 """
 CSE Communication System - GUI Client Frontend Component
 圖形化客戶端前端應用程式 - 處理UI顯示和使用者互動
+修改版：支援在GUI中輸入用戶名稱
 """
 
 import tkinter as tk
@@ -13,18 +14,10 @@ from datetime import datetime
 from client import CSEClient
 
 class CSEClientGUI:
-    def __init__(self, client_id):
-        self.client_id = client_id
-        
-        # 創建後端客戶端
-        self.client = CSEClient(client_id)
-        
-        # 設定回調函數
-        self.client.set_callbacks(
-            on_message=self.handle_new_message,
-            on_group_invite=self.handle_group_invite,
-            on_status_update=self.handle_status_update
-        )
+    def __init__(self):
+        # 初始化基本屬性（但還沒有client_id）
+        self.client_id = None
+        self.client = None
         
         # GUI相關屬性
         self.message_queue = queue.Queue()
@@ -37,7 +30,7 @@ class CSEClientGUI:
         
         # 建立主視窗
         self.root = tk.Tk()
-        self.root.title(f"CSE Client - {client_id}")
+        self.root.title("CSE Client")
         self.root.geometry("900x700")
         
         # 設定樣式
@@ -53,7 +46,7 @@ class CSEClientGUI:
         # 啟動定期更新線程
         self.refresh_timer = None
         
-        print(f"Client GUI {client_id} initialized")
+        print("Client GUI initialized")
     
     def setup_ui(self):
         """設定使用者介面"""
@@ -91,43 +84,107 @@ class CSEClientGUI:
     
     def setup_connection_tab(self):
         """設定連線分頁"""
-        # 服務發現區域
-        discovery_frame = ttk.LabelFrame(self.connection_frame, text="服務發現", padding=10)
-        discovery_frame.pack(fill=tk.X, padx=10, pady=10)
+        # 用戶登入區域
+        user_frame = ttk.LabelFrame(self.connection_frame, text="用戶資訊", padding=10)
+        user_frame.pack(fill=tk.X, padx=10, pady=10)
         
-        ttk.Label(discovery_frame, text="通關密語:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Label(user_frame, text="用戶名稱:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        self.username_var = tk.StringVar()
+        self.username_entry = ttk.Entry(user_frame, textvariable=self.username_var, width=30)
+        self.username_entry.grid(row=0, column=1, padx=5, pady=5)
+        self.username_entry.focus()  # 預設焦點
+        
+        # 用戶名稱確認按鈕
+        self.set_username_btn = ttk.Button(user_frame, text="設定用戶名稱", command=self.set_username)
+        self.set_username_btn.grid(row=0, column=2, padx=5, pady=5)
+        
+        # 顯示當前用戶
+        self.current_user_label = ttk.Label(user_frame, text="", font=('Arial', 10, 'bold'), foreground='blue')
+        self.current_user_label.grid(row=1, column=0, columnspan=3, padx=5, pady=5)
+        
+        # 服務發現區域（初始為禁用）
+        self.discovery_frame = ttk.LabelFrame(self.connection_frame, text="服務發現", padding=10)
+        self.discovery_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        ttk.Label(self.discovery_frame, text="通關密語:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
         self.passphrase_var = tk.StringVar()
-        self.passphrase_entry = ttk.Entry(discovery_frame, textvariable=self.passphrase_var, width=30, show="*")
+        self.passphrase_entry = ttk.Entry(self.discovery_frame, textvariable=self.passphrase_var, width=30, show="*", state='disabled')
         self.passphrase_entry.grid(row=0, column=1, padx=5, pady=5)
         
-        self.discover_btn = ttk.Button(discovery_frame, text="發現服務", command=self.discover_services_async)
+        self.discover_btn = ttk.Button(self.discovery_frame, text="發現服務", command=self.discover_services_async, state='disabled')
         self.discover_btn.grid(row=0, column=2, padx=5, pady=5)
         
         # 服務狀態顯示
-        self.service_status_text = scrolledtext.ScrolledText(discovery_frame, height=5, width=50)
+        self.service_status_text = scrolledtext.ScrolledText(self.discovery_frame, height=5, width=50, state='disabled')
         self.service_status_text.grid(row=1, column=0, columnspan=3, padx=5, pady=5)
         
-        # 登入/註冊區域
-        auth_frame = ttk.LabelFrame(self.connection_frame, text="身份驗證", padding=10)
-        auth_frame.pack(fill=tk.X, padx=10, pady=10)
+        # 登入/註冊區域（初始為禁用）
+        self.auth_frame = ttk.LabelFrame(self.connection_frame, text="身份驗證", padding=10)
+        self.auth_frame.pack(fill=tk.X, padx=10, pady=10)
         
-        ttk.Label(auth_frame, text="密碼:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Label(self.auth_frame, text="密碼:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
         self.password_var = tk.StringVar()
-        self.password_entry = ttk.Entry(auth_frame, textvariable=self.password_var, width=30, show="*")
+        self.password_entry = ttk.Entry(self.auth_frame, textvariable=self.password_var, width=30, show="*", state='disabled')
         self.password_entry.grid(row=0, column=1, padx=5, pady=5)
         
-        self.register_btn = ttk.Button(auth_frame, text="註冊", command=self.register_async, state='disabled')
+        self.register_btn = ttk.Button(self.auth_frame, text="註冊", command=self.register_async, state='disabled')
         self.register_btn.grid(row=1, column=0, padx=5, pady=5)
         
-        self.login_btn = ttk.Button(auth_frame, text="登入", command=self.login_async, state='disabled')
+        self.login_btn = ttk.Button(self.auth_frame, text="登入", command=self.login_async, state='disabled')
         self.login_btn.grid(row=1, column=1, padx=5, pady=5)
         
-        self.logout_btn = ttk.Button(auth_frame, text="登出", command=self.logout, state='disabled')
+        self.logout_btn = ttk.Button(self.auth_frame, text="登出", command=self.logout, state='disabled')
         self.logout_btn.grid(row=1, column=2, padx=5, pady=5)
         
         # 認證狀態顯示
-        self.auth_status_label = ttk.Label(auth_frame, text="", foreground="blue")
+        self.auth_status_label = ttk.Label(self.auth_frame, text="", foreground="blue")
         self.auth_status_label.grid(row=2, column=0, columnspan=3, padx=5, pady=5)
+        
+        # 設定Enter鍵綁定
+        self.username_entry.bind('<Return>', lambda e: self.set_username())
+        self.passphrase_entry.bind('<Return>', lambda e: self.discover_services_async())
+        self.password_entry.bind('<Return>', lambda e: self.login_async())
+    
+    def set_username(self):
+        """設定用戶名稱"""
+        username = self.username_var.get().strip()
+        if not username:
+            messagebox.showerror("錯誤", "請輸入用戶名稱")
+            return
+        
+        # 檢查用戶名稱是否包含非法字符
+        if any(char in username for char in ['/', '\\', ':', '*', '?', '"', '<', '>', '|', ' ']):
+            messagebox.showerror("錯誤", "用戶名稱不能包含特殊字符或空格")
+            return
+        
+        # 設定用戶名稱
+        self.client_id = username
+        self.client = CSEClient(self.client_id)
+        
+        # 設定回調函數
+        self.client.set_callbacks(
+            on_message=self.handle_new_message,
+            on_group_invite=self.handle_group_invite,
+            on_status_update=self.handle_status_update
+        )
+        
+        # 更新UI
+        self.current_user_label.config(text=f"當前用戶: {self.client_id}")
+        self.root.title(f"CSE Client - {self.client_id}")
+        
+        # 禁用用戶名稱輸入，啟用其他功能
+        self.username_entry.config(state='disabled')
+        self.set_username_btn.config(state='disabled')
+        
+        # 啟用服務發現
+        self.passphrase_entry.config(state='normal')
+        self.discover_btn.config(state='normal')
+        self.service_status_text.config(state='normal')
+        
+        # 將焦點移到通關密語
+        self.passphrase_entry.focus()
+        
+        messagebox.showinfo("成功", f"用戶名稱已設定為: {self.client_id}")
     
     def setup_chat_tab(self):
         """設定聊天分頁"""
@@ -251,6 +308,10 @@ class CSEClientGUI:
     
     def discover_services_async(self):
         """非同步發現服務"""
+        if not self.client:
+            messagebox.showerror("錯誤", "請先設定用戶名稱")
+            return
+            
         passphrase = self.passphrase_var.get()
         if not passphrase:
             messagebox.showerror("錯誤", "請輸入通關密語")
@@ -276,6 +337,10 @@ class CSEClientGUI:
     
     def register_async(self):
         """非同步註冊"""
+        if not self.client:
+            messagebox.showerror("錯誤", "請先設定用戶名稱")
+            return
+            
         password = self.password_var.get()
         if not password:
             messagebox.showerror("錯誤", "請輸入密碼")
@@ -294,6 +359,10 @@ class CSEClientGUI:
     
     def login_async(self):
         """非同步登入"""
+        if not self.client:
+            messagebox.showerror("錯誤", "請先設定用戶名稱")
+            return
+            
         password = self.password_var.get()
         if not password:
             messagebox.showerror("錯誤", "請輸入密碼")
@@ -316,6 +385,9 @@ class CSEClientGUI:
     
     def logout(self):
         """登出"""
+        if not self.client:
+            return
+            
         self.client.logout()
         
         # 停止自動更新
@@ -428,6 +500,10 @@ class CSEClientGUI:
     
     def send_message(self):
         """發送個人訊息"""
+        if not self.client:
+            messagebox.showerror("錯誤", "請先登入")
+            return
+            
         if not hasattr(self, 'current_chat_target') or not self.current_chat_target:
             messagebox.showwarning("警告", "請先選擇聊天對象")
             return
@@ -467,6 +543,10 @@ class CSEClientGUI:
     
     def send_group_message(self):
         """發送群組訊息"""
+        if not self.client:
+            messagebox.showerror("錯誤", "請先登入")
+            return
+            
         if not hasattr(self, 'current_group_id') or not self.current_group_id:
             messagebox.showwarning("警告", "請先選擇群組")
             return
@@ -517,6 +597,10 @@ class CSEClientGUI:
     
     def create_group_dialog(self):
         """創建群組對話框"""
+        if not self.client:
+            messagebox.showerror("錯誤", "請先登入")
+            return
+            
         online_clients = self.client.get_online_clients()
         if not online_clients or len(online_clients) <= 1:
             messagebox.showwarning("警告", "沒有其他在線用戶，無法創建群組")
@@ -644,7 +728,10 @@ class CSEClientGUI:
                         self.service_status_text.insert(tk.END, f"KACLS: {self.client.get_service_address('kacls')}\n")
                         self.register_btn.config(state='normal')
                         self.login_btn.config(state='normal')
+                        self.password_entry.config(state='normal')
                         self.status_var.set("服務已連線")
+                        # 將焦點移到密碼欄位
+                        self.password_entry.focus()
                     else:
                         self.service_status_text.insert(tk.END, "✗ 服務發現失敗\n")
                         messagebox.showerror("錯誤", "服務發現失敗，請檢查通關密語")
@@ -826,7 +913,7 @@ class CSEClientGUI:
     
     def _refresh_online_users(self):
         """刷新在線使用者列表"""
-        if not self.client.is_authenticated:
+        if not self.client or not self.client.is_authenticated:
             return
             
         try:
@@ -840,7 +927,7 @@ class CSEClientGUI:
     
     def _refresh_groups(self):
         """刷新群組列表"""
-        if not self.client.is_authenticated:
+        if not self.client or not self.client.is_authenticated:
             return
             
         try:
@@ -858,12 +945,8 @@ class CSEClientGUI:
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python client_gui.py <client_id>")
-        sys.exit(1)
-    
-    client_id = sys.argv[1]
-    gui = CSEClientGUI(client_id)
+    # 不再需要命令列參數
+    gui = CSEClientGUI()
     gui.run()
 
 
