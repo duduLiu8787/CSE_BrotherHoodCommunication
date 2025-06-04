@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-CSE Communication System - Client Component
-客戶端應用程式，用於加密通訊
+CSE Communication System - Client Backend Component
+客戶端後端邏輯 - 處理加密、通訊、認證等核心功能
 """
 
-import sys
 import json
 import threading
 import time
-import getpass
-import socket
 import base64
 from datetime import datetime
 from common_utils import *
@@ -18,25 +15,36 @@ class CSEClient:
     def __init__(self, client_id):
         self.client_id = client_id
         self.logger = setup_logger(f'CSEClient_{client_id}', f'client_{client_id}.log')
+        
+        # 加密相關
+        self.client_private_key, self.client_public_key = CryptoUtils.generate_rsa_keypair()
+        
+        # 核心屬性
         self.three_p_jwt = None
         self.is_authenticated = False
-        self.heartbeat_thread = None
-        self.message_check_thread = None
-        self.new_messages = []
-        self.message_lock = threading.Lock()
-        self.groups = {}  # 儲存已加入的群組
-        
-        # 服務發現相關
-        self.services = {}  # 儲存發現的服務 {role: {'address': ip, 'public_key': key}}
+        self.services = {}
+        self.groups = {}
+        self.online_clients = []
         self.service_discovered = threading.Event()
-        self.stop_discovery = False  # 新增：控制是否停止服務發現
+        self.stop_discovery = False
         
         # 服務端口
         self.server_port = NetworkUtils.SERVICE_PORTS['server']
         self.idp_port = NetworkUtils.SERVICE_PORTS['idp']
         self.kacls_port = NetworkUtils.SERVICE_PORTS['kacls']
         
-        self.logger.info(f"Client {client_id} initialized")
+        # 回調函數（由GUI設定）
+        self.on_message_received = None
+        self.on_group_invite = None
+        self.on_status_update = None
+        
+        self.logger.info(f"Client {client_id} initialized with encryption support")
+    
+    def set_callbacks(self, on_message=None, on_group_invite=None, on_status_update=None):
+        """設定回調函數"""
+        self.on_message_received = on_message
+        self.on_group_invite = on_group_invite
+        self.on_status_update = on_status_update
     
     def discover_services(self, passphrase, timeout=30):
         """通過廣播發現服務"""
@@ -54,9 +62,7 @@ class CSEClient:
         # 等待服務發現完成
         if self.service_discovered.wait(timeout):
             self.logger.info("Service discovery completed successfully")
-            # 停止服務發現
             self.stop_discovery = True
-            # 等待監聽線程結束
             listen_thread.join(timeout=2)
             return True
         else:
@@ -68,7 +74,7 @@ class CSEClient:
         """監聽服務器廣播"""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.settimeout(1.0)  # 設置超時，以便可以定期檢查是否需要停止
+        sock.settimeout(1.0)
         sock.bind(('', NetworkUtils.BROADCAST_PORT))
         
         while not self.stop_discovery:
@@ -83,19 +89,15 @@ class CSEClient:
                     message = json.loads(decrypted_msg)
                     
                     if message.get('type') == 'service_announcement' and message.get('role') == 'server':
-                        # 如果已經發現服務，忽略後續廣播
                         if self.service_discovered.is_set():
                             continue
                             
                         self.logger.info(f"Discovered server at {addr[0]}")
-                        # 響應服務器
                         self._respond_to_server(addr[0], message, passphrase)
                 except Exception:
-                    # 解密失敗，忽略此訊息
                     pass
                     
             except socket.timeout:
-                # 超時是正常的，繼續監聽
                 continue
             except Exception as e:
                 if not self.stop_discovery:
@@ -106,39 +108,36 @@ class CSEClient:
     
     def _respond_to_server(self, server_addr, server_message, passphrase):
         """響應服務器廣播並獲取所有服務信息"""
-        # 如果已經發現服務，不再響應
         if self.service_discovered.is_set():
             return
             
-        # 等待一下確保Server的TCP服務已啟動
         time.sleep(0.5)
         
-        # 準備響應
+        server_public_key = CryptoUtils.deserialize_public_key(server_message.get('public_key'))
+        
         response = {
             'type': 'client_discovery',
             'client_id': self.client_id,
-            'passphrase': passphrase  # 明文通關密語驗證
+            'public_key': CryptoUtils.serialize_public_key(self.client_public_key)
         }
         
-        # 發送TCP響應給Server
         try:
             result = NetworkUtils.send_tcp_message(
                 server_addr,
                 server_message.get('port'),
-                response
+                response,
+                encrypt_with_public_key=server_public_key,
+                sign_with_private_key=self.client_private_key
             )
             
             if result and result.get('status') == 'success':
-                # 儲存服務信息
                 services_info = result.get('services', {})
                 
-                # 儲存Server信息
                 self.services['server'] = {
                     'address': server_addr,
-                    'public_key': CryptoUtils.deserialize_public_key(server_message.get('public_key'))
+                    'public_key': server_public_key
                 }
                 
-                # 儲存其他服務信息
                 for role, info in services_info.items():
                     self.services[role] = {
                         'address': info['address'],
@@ -147,7 +146,6 @@ class CSEClient:
                 
                 self.logger.info(f"Discovered services: {list(self.services.keys())}")
                 
-                # 標記服務發現完成
                 if all(role in self.services for role in ['server', 'idp', 'kacls']):
                     self.service_discovered.set()
                 else:
@@ -173,10 +171,17 @@ class CSEClient:
         request = {
             'type': 'register',
             'client_id': self.client_id,
-            'password': password
+            'password': password,
+            'client_public_key': CryptoUtils.serialize_public_key(self.client_public_key)
         }
         
-        response = NetworkUtils.send_tcp_message(idp_host, self.idp_port, request)
+        response = NetworkUtils.send_tcp_message(
+            idp_host, 
+            self.idp_port, 
+            request,
+            encrypt_with_public_key=self.services['idp']['public_key'],
+            sign_with_private_key=self.client_private_key
+        )
         
         if response.get('status') == 'success':
             self.three_p_jwt = response.get('3p_jwt')
@@ -186,25 +191,68 @@ class CSEClient:
             self.logger.error(f"Registration failed: {response.get('message')}")
             return False
     
-    def authenticate(self, password):
-        """向IdP認證"""
+    def authenticate(self, password, progress_callback=None):
+        """向IdP認證（含挑戰驗證）"""
         idp_host = self.get_service_address('idp')
         if not idp_host:
             self.logger.error("IdP service not discovered")
             return False
             
+        # 第一步：發送密碼進行驗證
         request = {
             'type': 'authenticate',
             'client_id': self.client_id,
             'password': password
         }
         
-        response = NetworkUtils.send_tcp_message(idp_host, self.idp_port, request)
+        response = NetworkUtils.send_tcp_message(
+            idp_host, 
+            self.idp_port, 
+            request,
+            encrypt_with_public_key=self.services['idp']['public_key'],
+            sign_with_private_key=self.client_private_key
+        )
         
+        # 檢查是否收到挑戰
+        if response.get('status') == 'challenge':
+            self.logger.info("Received authentication challenge from IdP")
+            
+            if progress_callback:
+                progress_callback("正在進行挑戰驗證...")
+            
+            # 取得挑戰
+            challenge = response.get('challenge')
+            if not challenge:
+                self.logger.error("No challenge provided")
+                return False
+            
+            # 使用私鑰簽名挑戰
+            try:
+                signed_challenge = CryptoUtils.sign_data(self.client_private_key, challenge)
+            except Exception as e:
+                self.logger.error(f"Failed to sign challenge: {e}")
+                return False
+            
+            # 第二步：發送簽名的挑戰
+            challenge_response = {
+                'type': 'auth_challenge_response',
+                'client_id': self.client_id,
+                'signed_challenge': signed_challenge
+            }
+            
+            response = NetworkUtils.send_tcp_message(
+                idp_host,
+                self.idp_port,
+                challenge_response,
+                encrypt_with_public_key=self.services['idp']['public_key'],
+                sign_with_private_key=self.client_private_key
+            )
+        
+        # 處理最終回應
         if response.get('status') == 'success':
             self.three_p_jwt = response.get('3p_jwt')
             self.is_authenticated = True
-            self.logger.info("Authentication successful")
+            self.logger.info("Authentication successful with challenge verification")
             
             # 向Server註冊
             self._register_with_server()
@@ -214,14 +262,21 @@ class CSEClient:
             
             # 啟動心跳線程
             self._start_heartbeat()
-
+            
             # 啟動訊息檢查線程
             self._start_message_checker()
-
+            
             return True
         else:
             self.logger.error(f"Authentication failed: {response.get('message')}")
             return False
+    
+    def logout(self):
+        """登出"""
+        self.is_authenticated = False
+        self.three_p_jwt = None
+        self.stop_all_threads = True
+        self.logger.info("Logged out")
     
     def _register_with_server(self):
         """向Server註冊"""
@@ -233,10 +288,17 @@ class CSEClient:
         request = {
             'type': 'register_client',
             'client_id': self.client_id,
-            '3p_jwt': self.three_p_jwt
+            '3p_jwt': self.three_p_jwt,
+            'public_key': CryptoUtils.serialize_public_key(self.client_public_key)
         }
         
-        response = NetworkUtils.send_tcp_message(server_host, self.server_port, request)
+        response = NetworkUtils.send_tcp_message(
+            server_host, 
+            self.server_port, 
+            request,
+            encrypt_with_public_key=self.services['server']['public_key'],
+            sign_with_private_key=self.client_private_key
+        )
         
         if response.get('status') == 'success':
             self.logger.info("Registered with server")
@@ -247,20 +309,148 @@ class CSEClient:
         """啟動心跳線程"""
         def heartbeat():
             server_host = self.get_service_address('server')
-            while self.is_authenticated and server_host:
+            while self.is_authenticated and server_host and not getattr(self, 'stop_all_threads', False):
                 request = {
                     'type': 'heartbeat',
                     'client_id': self.client_id
                 }
                 try:
-                    NetworkUtils.send_tcp_message(server_host, self.server_port, request)
+                    NetworkUtils.send_tcp_message(
+                        server_host, 
+                        self.server_port, 
+                        request,
+                        encrypt_with_public_key=self.services['server']['public_key'],
+                        sign_with_private_key=self.client_private_key
+                    )
                 except Exception as e:
                     self.logger.error(f"Heartbeat failed: {e}")
-                time.sleep(60)  # 每分鐘發送一次心跳
+                time.sleep(60)
         
-        self.heartbeat_thread = threading.Thread(target=heartbeat)
-        self.heartbeat_thread.daemon = True
-        self.heartbeat_thread.start()
+        heartbeat_thread = threading.Thread(target=heartbeat)
+        heartbeat_thread.daemon = True
+        heartbeat_thread.start()
+    
+    def _start_message_checker(self):
+        """啟動訊息檢查線程"""
+        def check_messages():
+            server_host = self.get_service_address('server')
+            while self.is_authenticated and server_host and not getattr(self, 'stop_all_threads', False):
+                try:
+                    request = {
+                        'type': 'check_messages',
+                        'client_id': self.client_id
+                    }
+                    
+                    response = NetworkUtils.send_tcp_message(
+                        server_host, 
+                        self.server_port, 
+                        request,
+                        encrypt_with_public_key=self.services['server']['public_key'],
+                        sign_with_private_key=self.client_private_key
+                    )
+                    
+                    if response.get('status') == 'success':
+                        new_messages = response.get('new_messages', [])
+                        
+                        for msg_info in new_messages:
+                            if msg_info.get('type') == 'group_invite':
+                                # 處理群組邀請
+                                group_id = msg_info['group_id']
+                                
+                                # 先加入基本資訊
+                                self.groups[group_id] = {
+                                    'name': msg_info['group_name'],
+                                    'members': []
+                                }
+                                
+                                # 獲取完整群組資訊
+                                request = {
+                                    'type': 'get_group_info',
+                                    'client_id': self.client_id,
+                                    'group_id': group_id
+                                }
+                                response = NetworkUtils.send_tcp_message(
+                                    server_host, 
+                                    self.server_port, 
+                                    request,
+                                    encrypt_with_public_key=self.services['server']['public_key'],
+                                    sign_with_private_key=self.client_private_key
+                                )
+                                
+                                if response.get('status') == 'success':
+                                    group_info = response.get('group')
+                                    self.groups[group_id]['members'] = group_info['members']
+                                
+                                # 通知GUI
+                                if self.on_group_invite:
+                                    self.on_group_invite(
+                                        group_id,
+                                        msg_info['group_name'],
+                                        msg_info['invited_by']
+                                    )
+                            else:
+                                # 自動讀取並解密訊息
+                                threading.Thread(
+                                    target=self._process_new_message,
+                                    args=(msg_info,),
+                                    daemon=True
+                                ).start()
+                            
+                except Exception as e:
+                    self.logger.error(f"Message check failed: {e}")
+                
+                time.sleep(3)  # 每3秒檢查一次新訊息
+        
+        message_check_thread = threading.Thread(target=check_messages)
+        message_check_thread.daemon = True
+        message_check_thread.start()
+    
+    def _process_new_message(self, msg_info):
+        """處理新訊息"""
+        try:
+            server_host = self.get_service_address('server')
+            if not server_host:
+                return
+            
+            # 認領訊息
+            claim_request = {
+                'type': 'claim_message',
+                'client_id': self.client_id,
+                'message_id': msg_info['message_id']
+            }
+            
+            response = NetworkUtils.send_tcp_message(
+                server_host, 
+                self.server_port, 
+                claim_request,
+                encrypt_with_public_key=self.services['server']['public_key'],
+                sign_with_private_key=self.client_private_key
+            )
+            
+            # 處理挑戰
+            if response.get('status') == 'challenge':
+                challenge = response.get('challenge')
+                claim_request['challenge_response'] = challenge
+                response = NetworkUtils.send_tcp_message(
+                    server_host, 
+                    self.server_port, 
+                    claim_request,
+                    encrypt_with_public_key=self.services['server']['public_key'],
+                    sign_with_private_key=self.client_private_key
+                )
+            
+            if response.get('status') == 'success':
+                b_jwt = response.get('b_jwt')
+                
+                # 使用 B_JWT 接收並解密訊息
+                decrypted = self.receive_message(msg_info['message_id'], b_jwt)
+                
+                if decrypted and self.on_message_received:
+                    # 通知GUI收到新訊息
+                    self.on_message_received(decrypted)
+                    
+        except Exception as e:
+            self.logger.error(f"Process new message error: {e}")
     
     def get_online_clients(self):
         """獲取在線客戶端列表"""
@@ -274,7 +464,13 @@ class CSEClient:
             'client_id': self.client_id
         }
         
-        response = NetworkUtils.send_tcp_message(server_host, self.server_port, request)
+        response = NetworkUtils.send_tcp_message(
+            server_host, 
+            self.server_port, 
+            request,
+            encrypt_with_public_key=self.services['server']['public_key'],
+            sign_with_private_key=self.client_private_key
+        )
         
         if response.get('status') == 'success':
             return response.get('online_clients', [])
@@ -296,7 +492,13 @@ class CSEClient:
             'members': member_ids
         }
         
-        response = NetworkUtils.send_tcp_message(server_host, self.server_port, request)
+        response = NetworkUtils.send_tcp_message(
+            server_host, 
+            self.server_port, 
+            request,
+            encrypt_with_public_key=self.services['server']['public_key'],
+            sign_with_private_key=self.client_private_key
+        )
         
         if response.get('status') == 'success':
             group_id = response.get('group_id')
@@ -310,8 +512,13 @@ class CSEClient:
             self.logger.error(f"Failed to create group: {response.get('message')}")
             return False, response.get('message')
     
-    def _get_my_groups(self):
+    def get_my_groups(self):
         """獲取已加入的群組"""
+        self._get_my_groups()
+        return self.groups
+    
+    def _get_my_groups(self):
+        """內部方法：獲取已加入的群組"""
         server_host = self.get_service_address('server')
         if not server_host:
             return
@@ -321,7 +528,13 @@ class CSEClient:
             'client_id': self.client_id
         }
         
-        response = NetworkUtils.send_tcp_message(server_host, self.server_port, request)
+        response = NetworkUtils.send_tcp_message(
+            server_host, 
+            self.server_port, 
+            request,
+            encrypt_with_public_key=self.services['server']['public_key'],
+            sign_with_private_key=self.client_private_key
+        )
         
         if response.get('status') == 'success':
             self.groups = response.get('groups', {})
@@ -346,7 +559,6 @@ class CSEClient:
         
         # 向KACLS請求包裝DEK
         if is_group:
-            # 群組訊息：包含所有成員
             group_members = self.groups.get(receiver_id, {}).get('members', [])
             wrap_request = {
                 'type': 'wrap_dek',
@@ -358,7 +570,6 @@ class CSEClient:
                 'group_id': receiver_id
             }
         else:
-            # 個人訊息：單一接收者
             wrap_request = {
                 'type': 'wrap_dek',
                 '3p_jwt': self.three_p_jwt,
@@ -366,7 +577,14 @@ class CSEClient:
                 'client_id': self.client_id,
                 'receivers': [receiver_id]
             }
-        wrap_response = NetworkUtils.send_tcp_message(kacls_host, self.kacls_port, wrap_request)
+        
+        wrap_response = NetworkUtils.send_tcp_message(
+            kacls_host, 
+            self.kacls_port, 
+            wrap_request,
+            encrypt_with_public_key=self.services['kacls']['public_key'],
+            sign_with_private_key=self.client_private_key
+        )
         
         if wrap_response.get('status') != 'success':
             self.logger.error(f"Failed to wrap DEK: {wrap_response.get('message')}")
@@ -378,12 +596,18 @@ class CSEClient:
         send_request = {
             'type': 'send_group_message' if is_group else 'send_message',
             'sender_id': self.client_id,
-            'receiver_id': receiver_id,  # 如果是群組，這裡是group_id
+            'receiver_id': receiver_id,
             'encrypted_data': encrypted_message,
             'w_dek': w_dek
         }
         
-        send_response = NetworkUtils.send_tcp_message(server_host, self.server_port, send_request)
+        send_response = NetworkUtils.send_tcp_message(
+            server_host, 
+            self.server_port, 
+            send_request,
+            encrypt_with_public_key=self.services['server']['public_key'],
+            sign_with_private_key=self.client_private_key
+        )
         
         if send_response.get('status') == 'success':
             target_type = "group" if is_group else "user"
@@ -410,7 +634,13 @@ class CSEClient:
             'b_jwt': b_jwt
         }
         
-        get_response = NetworkUtils.send_tcp_message(server_host, self.server_port, get_request)
+        get_response = NetworkUtils.send_tcp_message(
+            server_host, 
+            self.server_port, 
+            get_request,
+            encrypt_with_public_key=self.services['server']['public_key'],
+            sign_with_private_key=self.client_private_key
+        )
         
         if get_response.get('status') != 'success':
             self.logger.error(f"Failed to get message: {get_response.get('message')}")
@@ -427,7 +657,13 @@ class CSEClient:
             'client_id': self.client_id
         }
         
-        unwrap_response = NetworkUtils.send_tcp_message(kacls_host, self.kacls_port, unwrap_request)
+        unwrap_response = NetworkUtils.send_tcp_message(
+            kacls_host, 
+            self.kacls_port, 
+            unwrap_request,
+            encrypt_with_public_key=self.services['kacls']['public_key'],
+            sign_with_private_key=self.client_private_key
+        )
         
         if unwrap_response.get('status') != 'success':
             self.logger.error(f"Failed to unwrap DEK: {unwrap_response.get('message')}")
@@ -449,237 +685,3 @@ class CSEClient:
         except Exception as e:
             self.logger.error(f"Failed to decrypt message: {e}")
             return None
-    
-    def _start_message_checker(self):
-        """啟動訊息檢查線程"""
-        def check_messages():
-            server_host = self.get_service_address('server')
-            while self.is_authenticated and server_host:
-                try:
-                    request = {
-                        'type': 'check_messages',
-                        'client_id': self.client_id
-                    }
-                    
-                    response = NetworkUtils.send_tcp_message(
-                        server_host, 
-                        self.server_port, 
-                        request
-                    )
-                    
-                    if response.get('status') == 'success':
-                        new_messages = response.get('new_messages', [])
-                        
-                        if new_messages:
-                            with self.message_lock:
-                                self.new_messages.extend(new_messages)
-                            
-                            # 顯示新訊息通知
-                            for msg_info in new_messages:
-                                if msg_info.get('type') == 'group_invite':
-                                    # 處理群組邀請
-                                    group_id = msg_info['group_id']
-                                    
-                                    # 先加入基本資訊
-                                    self.groups[group_id] = {
-                                        'name': msg_info['group_name'],
-                                        'members': []
-                                    }
-                                    
-                                    # 獲取完整群組資訊
-                                    request = {
-                                        'type': 'get_group_info',
-                                        'client_id': self.client_id,
-                                        'group_id': group_id
-                                    }
-                                    response = NetworkUtils.send_tcp_message(server_host, self.server_port, request)
-                                    
-                                    if response.get('status') == 'success':
-                                        group_info = response.get('group')
-                                        self.groups[group_id]['members'] = group_info['members']
-                                    
-                                    print(f"\n🎉 You've been added to group '{msg_info['group_name']}' by {msg_info['invited_by']}")
-                                    print(f"   Members: {', '.join(self.groups[group_id]['members'])}")
-                                elif msg_info.get('group_name'):
-                                    # 原有的群組訊息處理
-                                    print(f"\n🔔 New group message in '{msg_info['group_name']}' from {msg_info['from']} (ID: {msg_info['message_id']})")
-                                else:
-                                    # 原有的個人訊息處理
-                                    print(f"\n🔔 New message from {msg_info['from']} (ID: {msg_info['message_id']})")
-                                print("Type '4' to read messages or continue with your selection.")
-                except Exception as e:
-                    self.logger.error(f"Message check failed: {e}")
-                
-                time.sleep(3)  # 每3秒檢查一次新訊息
-        
-        self.message_check_thread = threading.Thread(target=check_messages)
-        self.message_check_thread.daemon = True
-        self.message_check_thread.start()
-
-    def read_pending_messages(self):
-        """讀取所有待處理的訊息"""
-        with self.message_lock:
-            pending = self.new_messages.copy()
-            self.new_messages.clear()
-        
-        if not pending:
-            print("No new messages.")
-            return
-        
-        print(f"\n📬 You have {len(pending)} new message(s):")
-        
-        for msg_info in pending:
-            if msg_info.get('type') == 'group_invite':
-                # 群組邀請已經在message checker中處理
-                continue
-                
-            if msg_info.get('group_name'):
-                print(f"\n--- Group message in '{msg_info['group_name']}' from {msg_info['from']} ---")
-            else:
-                print(f"\n--- Message from {msg_info['from']} ---")
-            print(f"Time: {msg_info['timestamp']}")
-            
-            # 先認領訊息（包含挑戰驗證）
-            server_host = self.get_service_address('server')
-            claim_request = {
-                'type': 'claim_message',
-                'client_id': self.client_id,
-                'message_id': msg_info['message_id']
-            }
-
-            # 發送認領請求
-            response = NetworkUtils.send_tcp_message(server_host, self.server_port, claim_request)
-
-            # 處理挑戰
-            if response.get('status') == 'challenge':
-                challenge = response.get('challenge')
-                claim_request['challenge_response'] = challenge
-                response = NetworkUtils.send_tcp_message(server_host, self.server_port, claim_request)
-
-            if response.get('status') == 'success':
-                b_jwt = response.get('b_jwt')
-                
-                # 使用 B_JWT 接收並解密訊息
-                decrypted = self.receive_message(msg_info['message_id'], b_jwt)
-                
-                if decrypted:
-                    print(f"Message: {decrypted['message']}")
-                else:
-                    print("Failed to decrypt message.")
-            else:
-                print(f"Failed to claim message: {response.get('message')}")
-            print("-" * 40)
-
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python client.py <client_id>")
-        sys.exit(1)
-    
-    client_id = sys.argv[1]
-    client = CSEClient(client_id)
-    
-    # 服務發現階段
-    print("🔍 Starting service discovery...")
-    passphrase = input("Enter passphrase to join the service: ")
-    
-    if not client.discover_services(passphrase):
-        print("❌ Failed to discover services. Please check the passphrase and try again.")
-        sys.exit(1)
-    
-    print("✅ Services discovered successfully!")
-    print(f"   Server: {client.get_service_address('server')}")
-    print(f"   IdP: {client.get_service_address('idp')}")
-    print(f"   KACLS: {client.get_service_address('kacls')}")
-    
-    # 互動式命令行界面
-    while True:
-        if not client.is_authenticated:
-            print("\n1. Register")
-            print("2. Login")
-            print("3. Exit")
-            choice = input("Choose an option: ")
-            
-            if choice == '1':
-                password = getpass.getpass("Enter password: ")
-                if client.register(password):
-                    print("Registration successful! Please login.")
-            elif choice == '2':
-                password = getpass.getpass("Enter password: ")
-                if client.authenticate(password):
-                    print("Login successful!")
-            elif choice == '3':
-                break
-        else:
-            print("\n1. List online clients")
-            print("2. Send direct message")
-            print("3. Send group message")
-            print("4. Read messages")
-            print("5. Create group")
-            print("6. List my groups")
-            print("7. Logout")
-            choice = input("Choose an option: ").strip()
-
-            if choice == '1':
-                online_clients = client.get_online_clients()
-                print(f"Online clients: {', '.join(online_clients)}")
-            elif choice == '2':
-                receiver = input("Enter receiver ID: ").strip()
-                message = input("Enter message: ")
-                if client.send_message(receiver, message):
-                    print("Message sent successfully!")
-                else:
-                    print("Failed to send message.")
-            elif choice == '3':
-                # 列出可用的群組
-                if not client.groups:
-                    print("You are not in any groups. Create a group first.")
-                else:
-                    print("\nYour groups:")
-                    for group_id, group_info in client.groups.items():
-                        print(f"  {group_id}: {group_info['name']} (members: {', '.join(group_info['members'])})")
-                    
-                    group_id = input("Enter group ID: ").strip()
-                    if group_id in client.groups:
-                        message = input("Enter message: ")
-                        if client.send_message(group_id, message, is_group=True):
-                            print("Group message sent successfully!")
-                        else:
-                            print("Failed to send group message.")
-                    else:
-                        print("Invalid group ID.")
-            elif choice == '4':
-                client.read_pending_messages()
-            elif choice == '5':
-                group_name = input("Enter group name: ").strip()
-                members_input = input("Enter member IDs (comma-separated, you are included by default): ").strip()
-                
-                if members_input:
-                    member_ids = [m.strip() for m in members_input.split(',')]
-                else:
-                    member_ids = []
-                
-                # 確保自己在成員列表中
-                if client.client_id not in member_ids:
-                    member_ids.append(client.client_id)
-                
-                success, result = client.create_group(group_name, member_ids)
-                if success:
-                    print(f"Group '{group_name}' created successfully! Group ID: {result}")
-                else:
-                    print(f"Failed to create group: {result}")
-            elif choice == '6':
-                if not client.groups:
-                    print("You are not in any groups.")
-                else:
-                    print("\nYour groups:")
-                    for group_id, group_info in client.groups.items():
-                        print(f"  ID: {group_id}")
-                        print(f"  Name: {group_info['name']}")
-                        print(f"  Members: {', '.join(group_info['members'])}")
-                        print("-" * 30)
-            elif choice == '7':
-                client.is_authenticated = False
-                print("Logged out.")
-
-if __name__ == "__main__":
-    main()

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 CSE Communication System - KACLS (Key Access Control Lockdown Service) Component
-負責管理KEK和DEK的加密解密 - 加密通訊版本
+負責管理KEK和DEK的加密解密 - 加密通訊版本（修正版）
 """
 
 import sys
@@ -115,11 +115,12 @@ class CSEKACLS:
             return {'status': 'error', 'message': 'Unknown request type'}
     
     def _verify_tokens(self, three_p_jwt, b_jwt=None):
-        """驗證JWT tokens - 使用加密通道"""
+        """驗證JWT tokens - 使用加密通道，返回驗證結果和payload"""
         # 驗證3P_JWT
         idp_addr = self.registry.get_service('idp')
         if not idp_addr:
-            return False, "IdP service not available"
+            self.logger.error("IdP service not available")
+            return False, "IdP service not available", None
         
         verify_3p_request = {
             'type': 'verify_jwt',
@@ -127,23 +128,38 @@ class CSEKACLS:
             'token_type': '3P_JWT'
         }
         
+        self.logger.debug(f"Verifying 3P_JWT with IdP at {idp_addr}")
+        
         # 使用加密通道向IdP驗證
-        idp_response = NetworkUtils.send_tcp_message(
-            idp_addr,
-            NetworkUtils.SERVICE_PORTS['idp'],
-            verify_3p_request,
-            encrypt_with_public_key=self.registry.get_public_key('idp'),
-            sign_with_private_key=self.private_key
-        )
+        try:
+            idp_response = NetworkUtils.send_tcp_message(
+                idp_addr,
+                NetworkUtils.SERVICE_PORTS['idp'],
+                verify_3p_request,
+                encrypt_with_public_key=self.registry.get_public_key('idp'),
+                sign_with_private_key=self.private_key
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to communicate with IdP: {e}")
+            return False, "Failed to communicate with IdP", None
+        
+        if not idp_response:
+            self.logger.error("No response from IdP")
+            return False, "No response from IdP", None
         
         if not idp_response.get('valid'):
-            return False, "Invalid 3P_JWT"
+            self.logger.warning("Invalid 3P_JWT")
+            return False, "Invalid 3P_JWT", None
+        
+        self.logger.debug("3P_JWT verified successfully")
         
         # 如果提供了B_JWT，也要驗證
+        b_jwt_payload = None
         if b_jwt:
             server_addr = self.registry.get_service('server')
             if not server_addr:
-                return False, "Server service not available"
+                self.logger.error("Server service not available")
+                return False, "Server service not available", None
             
             verify_b_request = {
                 'type': 'verify_jwt',
@@ -151,19 +167,34 @@ class CSEKACLS:
                 'token_type': 'B_JWT'
             }
             
+            self.logger.debug(f"Verifying B_JWT with Server at {server_addr}")
+            
             # 使用加密通道向Server驗證
-            server_response = NetworkUtils.send_tcp_message(
-                server_addr,
-                NetworkUtils.SERVICE_PORTS['server'],
-                verify_b_request,
-                encrypt_with_public_key=self.registry.get_public_key('server'),
-                sign_with_private_key=self.private_key
-            )
+            try:
+                server_response = NetworkUtils.send_tcp_message(
+                    server_addr,
+                    NetworkUtils.SERVICE_PORTS['server'],
+                    verify_b_request,
+                    encrypt_with_public_key=self.registry.get_public_key('server'),
+                    sign_with_private_key=self.private_key
+                )
+            except Exception as e:
+                self.logger.error(f"Failed to communicate with Server: {e}")
+                return False, "Failed to communicate with Server", None
+            
+            if not server_response:
+                self.logger.error("No response from Server")
+                return False, "No response from Server", None
             
             if not server_response.get('valid'):
-                return False, "Invalid B_JWT"
+                self.logger.warning("Invalid B_JWT")
+                return False, "Invalid B_JWT", None
+            
+            # 獲取 B_JWT 的 payload
+            b_jwt_payload = server_response.get('payload')
+            self.logger.debug("B_JWT verified successfully")
         
-        return True, "Tokens verified"
+        return True, "Tokens verified", b_jwt_payload
     
     def _handle_wrap_dek(self, request):
         """處理DEK加密請求"""
@@ -175,7 +206,7 @@ class CSEKACLS:
         group_id = request.get('group_id')
         
         # 驗證3P_JWT
-        valid, message = self._verify_tokens(three_p_jwt)
+        valid, message, _ = self._verify_tokens(three_p_jwt)
         if not valid:
             return {'status': 'error', 'message': message}
         
@@ -223,6 +254,8 @@ class CSEKACLS:
             
         except Exception as e:
             self.logger.error(f"Error wrapping DEK: {e}")
+            import traceback
+            traceback.print_exc()
             return {'status': 'error', 'message': 'Failed to wrap DEK'}
     
     def _handle_unwrap_dek(self, request):
@@ -232,14 +265,21 @@ class CSEKACLS:
         w_dek_data = request.get('w_dek')
         client_id = request.get('client_id')
         
-        # 驗證兩個JWT
-        valid, message = self._verify_tokens(three_p_jwt, b_jwt)
+        self.logger.debug(f"Unwrap DEK request from client {client_id}")
+        
+        # 驗證兩個JWT，並獲取 B_JWT 的 payload
+        valid, message, b_jwt_payload = self._verify_tokens(three_p_jwt, b_jwt)
         if not valid:
+            self.logger.error(f"Token verification failed: {message}")
             return {'status': 'error', 'message': message}
         
         try:
-            # 解析JWT以獲取user_id
-            b_jwt_payload = JWTUtils.verify_jwt(b_jwt, self.registry.get_public_key('server'))
+            # 確保我們有 B_JWT payload
+            if not b_jwt_payload:
+                self.logger.error("No B_JWT payload received from server")
+                return {'status': 'error', 'message': 'No B_JWT payload'}
+            
+            self.logger.debug(f"B_JWT payload from server: {b_jwt_payload}")
             
             # 使用KEK解密獲取DEK和綁定資訊
             decrypted_data = CryptoUtils.decrypt_aes_gcm(
@@ -251,14 +291,17 @@ class CSEKACLS:
             combined_data = json.loads(decrypted_data)
             binding_info = combined_data.get('binding', {})
             
+            self.logger.debug(f"Binding info: {binding_info}")
+            
             # 驗證客戶端是否在授權接收者列表中
             authorized_receivers = binding_info.get('authorized_receivers', [])
             if client_id not in authorized_receivers:
-                self.logger.warning(f"Client {client_id} not in authorized receivers list")
+                self.logger.warning(f"Client {client_id} not in authorized receivers list: {authorized_receivers}")
                 return {'status': 'error', 'message': 'Access denied - not authorized for this DEK'}
             
             # 驗證B_JWT的user_id也匹配
             if b_jwt_payload.get('user_id') != client_id:
+                self.logger.warning(f"B_JWT user_id mismatch: {b_jwt_payload.get('user_id')} != {client_id}")
                 return {'status': 'error', 'message': 'B_JWT user mismatch'}
             
             dek = base64.b64decode(combined_data['dek'])
@@ -281,6 +324,8 @@ class CSEKACLS:
             
         except Exception as e:
             self.logger.error(f"Error unwrapping DEK: {e}")
+            import traceback
+            traceback.print_exc()
             return {'status': 'error', 'message': 'Failed to unwrap DEK'}
         
     def _handle_update_services(self, request):

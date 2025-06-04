@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-CSE Communication System - GUI Client Component
-圖形化客戶端應用程式 - 加密通訊版本
+CSE Communication System - GUI Client Frontend Component
+圖形化客戶端前端應用程式 - 處理UI顯示和使用者互動
 """
 
 import tkinter as tk
@@ -9,40 +9,31 @@ from tkinter import ttk, messagebox, scrolledtext
 import threading
 import queue
 import sys
-import json
-import time
-import base64
 from datetime import datetime
-from common_utils import *
+from client import CSEClient
 
 class CSEClientGUI:
     def __init__(self, client_id):
         self.client_id = client_id
-        self.logger = setup_logger(f'CSEClientGUI_{client_id}', f'client_gui_{client_id}.log')
         
-        # 加密相關
-        self.client_private_key, self.client_public_key = CryptoUtils.generate_rsa_keypair()
+        # 創建後端客戶端
+        self.client = CSEClient(client_id)
         
-        # 核心屬性
-        self.three_p_jwt = None
-        self.is_authenticated = False
-        self.services = {}
-        self.groups = {}
-        self.online_clients = []
+        # 設定回調函數
+        self.client.set_callbacks(
+            on_message=self.handle_new_message,
+            on_group_invite=self.handle_group_invite,
+            on_status_update=self.handle_status_update
+        )
+        
+        # GUI相關屬性
         self.message_queue = queue.Queue()
-        self.service_discovered = threading.Event()
-        self.stop_discovery = False
-        self.new_messages = []
-        self.message_lock = threading.Lock()
-        
-        # 聊天記錄儲存
         self.chat_history = {}  # {user_id: [messages]}
         self.group_chat_history = {}  # {group_id: [messages]}
-        
-        # 服務端口
-        self.server_port = NetworkUtils.SERVICE_PORTS['server']
-        self.idp_port = NetworkUtils.SERVICE_PORTS['idp']
-        self.kacls_port = NetworkUtils.SERVICE_PORTS['kacls']
+        self.current_chat_target = None
+        self.current_chat_type = None
+        self.current_group_id = None
+        self.current_group_name = None
         
         # 建立主視窗
         self.root = tk.Tk()
@@ -59,7 +50,10 @@ class CSEClientGUI:
         # 啟動訊息處理線程
         self.root.after(100, self.process_message_queue)
         
-        self.logger.info(f"Client GUI {client_id} initialized with encryption support")
+        # 啟動定期更新線程
+        self.refresh_timer = None
+        
+        print(f"Client GUI {client_id} initialized")
     
     def setup_ui(self):
         """設定使用者介面"""
@@ -130,8 +124,11 @@ class CSEClientGUI:
         
         self.logout_btn = ttk.Button(auth_frame, text="登出", command=self.logout, state='disabled')
         self.logout_btn.grid(row=1, column=2, padx=5, pady=5)
+        
+        # 認證狀態顯示
+        self.auth_status_label = ttk.Label(auth_frame, text="", foreground="blue")
+        self.auth_status_label.grid(row=2, column=0, columnspan=3, padx=5, pady=5)
     
-    # ... [其餘 UI setup 方法保持不變] ...
     def setup_chat_tab(self):
         """設定聊天分頁"""
         # 左側：在線使用者列表
@@ -250,6 +247,8 @@ class CSEClientGUI:
         self.group_send_btn = ttk.Button(group_input_frame, text="發送", command=self.send_group_message)
         self.group_send_btn.pack(side=tk.RIGHT)
     
+    # ===== 事件處理方法 =====
+    
     def discover_services_async(self):
         """非同步發現服務"""
         passphrase = self.passphrase_var.get()
@@ -267,12 +266,12 @@ class CSEClientGUI:
     def _discover_services_thread(self, passphrase):
         """服務發現線程"""
         try:
-            if self.discover_services(passphrase):
+            if self.client.discover_services(passphrase):
                 self.message_queue.put(('service_discovered', True))
             else:
                 self.message_queue.put(('service_discovered', False))
         except Exception as e:
-            self.logger.error(f"Service discovery error: {e}")
+            print(f"Service discovery error: {e}")
             self.message_queue.put(('service_discovered', False))
     
     def register_async(self):
@@ -287,10 +286,10 @@ class CSEClientGUI:
     def _register_thread(self, password):
         """註冊線程"""
         try:
-            success = self.register(password)
+            success = self.client.register(password)
             self.message_queue.put(('register_result', success))
         except Exception as e:
-            self.logger.error(f"Registration error: {e}")
+            print(f"Registration error: {e}")
             self.message_queue.put(('register_result', False))
     
     def login_async(self):
@@ -305,19 +304,24 @@ class CSEClientGUI:
     def _login_thread(self, password):
         """登入線程"""
         try:
-            success = self.authenticate(password)
+            # 定義進度回調函數
+            def progress_callback(status):
+                self.message_queue.put(('auth_status', status))
+            
+            success = self.client.authenticate(password, progress_callback)
             self.message_queue.put(('login_result', success))
         except Exception as e:
-            self.logger.error(f"Login error: {e}")
+            print(f"Login error: {e}")
             self.message_queue.put(('login_result', False))
     
     def logout(self):
         """登出"""
-        self.is_authenticated = False
-        self.three_p_jwt = None
+        self.client.logout()
         
-        # 停止所有背景線程
-        self.stop_all_threads = True
+        # 停止自動更新
+        if self.refresh_timer:
+            self.root.after_cancel(self.refresh_timer)
+            self.refresh_timer = None
         
         # 更新 UI
         self.notebook.tab(1, state='disabled')
@@ -326,6 +330,7 @@ class CSEClientGUI:
         self.login_btn.config(state='normal')
         self.logout_btn.config(state='disabled')
         self.status_var.set("已登出")
+        self.auth_status_label.config(text="")
         
         # 清空列表和聊天記錄
         self.online_listbox.delete(0, tk.END)
@@ -365,10 +370,10 @@ class CSEClientGUI:
             else:
                 # 舊格式相容
                 group_id = group_item
-                group_name = self.groups.get(group_id, {}).get('name', group_id)
+                group_name = self.client.groups.get(group_id, {}).get('name', group_id)
             
-            if group_id in self.groups:
-                members = self.groups[group_id]['members']
+            if group_id in self.client.groups:
+                members = self.client.groups[group_id]['members']
                 self.group_info_var.set(f"群組: {group_name}")
                 self.group_members_var.set(f"成員: {', '.join(members)}")
                 self.current_group_id = group_id
@@ -376,6 +381,8 @@ class CSEClientGUI:
                 
                 # 顯示群組聊天記錄
                 self.display_group_chat_history(group_id)
+    
+    # ===== 顯示相關方法 =====
     
     def display_chat_history(self, user_id):
         """顯示與特定使用者的聊天記錄"""
@@ -417,9 +424,11 @@ class CSEClientGUI:
         else:
             self.group_chat_display.insert(tk.END, f"{sender}: {content}\n", 'other_message')
     
+    # ===== 訊息發送方法 =====
+    
     def send_message(self):
         """發送個人訊息"""
-        if not hasattr(self, 'current_chat_target'):
+        if not hasattr(self, 'current_chat_target') or not self.current_chat_target:
             messagebox.showwarning("警告", "請先選擇聊天對象")
             return
         
@@ -458,7 +467,7 @@ class CSEClientGUI:
     
     def send_group_message(self):
         """發送群組訊息"""
-        if not hasattr(self, 'current_group_id'):
+        if not hasattr(self, 'current_group_id') or not self.current_group_id:
             messagebox.showwarning("警告", "請先選擇群組")
             return
         
@@ -498,15 +507,18 @@ class CSEClientGUI:
     def _send_message_thread(self, receiver_id, message, is_group):
         """發送訊息線程"""
         try:
-            success = self.send_message_backend(receiver_id, message, is_group)
+            success = self.client.send_message(receiver_id, message, is_group)
             self.message_queue.put(('send_result', (success, is_group)))
         except Exception as e:
-            self.logger.error(f"Send message error: {e}")
+            print(f"Send message error: {e}")
             self.message_queue.put(('send_result', (False, is_group)))
+    
+    # ===== 群組管理方法 =====
     
     def create_group_dialog(self):
         """創建群組對話框"""
-        if not self.online_clients:
+        online_clients = self.client.get_online_clients()
+        if not online_clients or len(online_clients) <= 1:
             messagebox.showwarning("警告", "沒有其他在線用戶，無法創建群組")
             return
             
@@ -537,7 +549,7 @@ class CSEClientGUI:
         scrollbar.config(command=member_listbox.yview)
         
         # 填充在線使用者
-        for user in self.online_clients:
+        for user in online_clients:
             if user != self.client_id:
                 member_listbox.insert(tk.END, user)
         
@@ -581,11 +593,42 @@ class CSEClientGUI:
     def _create_group_thread(self, group_name, members):
         """創建群組線程"""
         try:
-            success, result = self.create_group(group_name, members)
+            success, result = self.client.create_group(group_name, members)
             self.message_queue.put(('create_group_result', (success, result, group_name)))
         except Exception as e:
-            self.logger.error(f"Create group error: {e}")
+            print(f"Create group error: {e}")
             self.message_queue.put(('create_group_result', (False, str(e), group_name)))
+    
+    # ===== 回調處理方法 =====
+    
+    def handle_new_message(self, message_info):
+        """處理收到的新訊息"""
+        sender = message_info['from']
+        content = message_info['message']
+        timestamp = datetime.fromisoformat(message_info['timestamp']).strftime('%H:%M:%S')
+        group_id = message_info.get('group_id')
+        group_name = message_info.get('group_name')
+        
+        if group_id:
+            # 群組訊息
+            group_info = {
+                'group_id': group_id,
+                'group_name': group_name
+            }
+            self.message_queue.put(('new_message', (sender, content, timestamp, True, group_info)))
+        else:
+            # 個人訊息
+            self.message_queue.put(('new_message', (sender, content, timestamp, False, {})))
+    
+    def handle_group_invite(self, group_id, group_name, invited_by):
+        """處理群組邀請"""
+        self.message_queue.put(('group_invite', (group_id, group_name, invited_by)))
+    
+    def handle_status_update(self, status):
+        """處理狀態更新"""
+        self.message_queue.put(('status_update', status))
+    
+    # ===== 訊息佇列處理 =====
     
     def process_message_queue(self):
         """處理訊息佇列"""
@@ -596,9 +639,9 @@ class CSEClientGUI:
                 if msg_type == 'service_discovered':
                     if data:
                         self.service_status_text.insert(tk.END, "✓ 服務發現成功！\n")
-                        self.service_status_text.insert(tk.END, f"Server: {self.get_service_address('server')}\n")
-                        self.service_status_text.insert(tk.END, f"IdP: {self.get_service_address('idp')}\n")
-                        self.service_status_text.insert(tk.END, f"KACLS: {self.get_service_address('kacls')}\n")
+                        self.service_status_text.insert(tk.END, f"Server: {self.client.get_service_address('server')}\n")
+                        self.service_status_text.insert(tk.END, f"IdP: {self.client.get_service_address('idp')}\n")
+                        self.service_status_text.insert(tk.END, f"KACLS: {self.client.get_service_address('kacls')}\n")
                         self.register_btn.config(state='normal')
                         self.login_btn.config(state='normal')
                         self.status_var.set("服務已連線")
@@ -613,6 +656,10 @@ class CSEClientGUI:
                     else:
                         messagebox.showerror("錯誤", "註冊失敗")
                 
+                elif msg_type == 'auth_status':
+                    # 顯示認證狀態
+                    self.auth_status_label.config(text=data)
+                
                 elif msg_type == 'login_result':
                     if data:
                         self.notebook.tab(1, state='normal')
@@ -621,11 +668,13 @@ class CSEClientGUI:
                         self.login_btn.config(state='disabled')
                         self.logout_btn.config(state='normal')
                         self.status_var.set(f"已登入 - {self.client_id}")
+                        self.auth_status_label.config(text="")
                         messagebox.showinfo("成功", "登入成功！")
                         
                         # 啟動自動更新
                         self._start_auto_refresh()
                     else:
+                        self.auth_status_label.config(text="")
                         messagebox.showerror("錯誤", "登入失敗")
                 
                 elif msg_type == 'online_users':
@@ -635,7 +684,6 @@ class CSEClientGUI:
                         current_selection = self.online_listbox.get(self.online_listbox.curselection()[0])
                     
                     self.online_listbox.delete(0, tk.END)
-                    self.online_clients = data
                     for user in data:
                         if user != self.client_id:
                             self.online_listbox.insert(tk.END, user)
@@ -674,6 +722,8 @@ class CSEClientGUI:
                     success, result, group_name = data
                     if success:
                         messagebox.showinfo("成功", f"群組 '{group_name}' 創建成功！")
+                        # 刷新群組列表
+                        self._refresh_groups()
                     else:
                         messagebox.showerror("錯誤", f"創建群組失敗: {result}")
                 
@@ -731,14 +781,12 @@ class CSEClientGUI:
                     # 被加入群組的通知
                     group_id, group_name, invited_by = data
                     self.show_notification("群組邀請", f"{invited_by} 將您加入群組 '{group_name}'")
+                    # 刷新群組列表
+                    self._refresh_groups()
                 
-                elif msg_type == 'new_message_count':
-                    # 更新新訊息計數
-                    count = data
-                    if count > 0:
-                        self.new_msg_indicator.config(text=f"📬 {count} 則新訊息")
-                    else:
-                        self.new_msg_indicator.config(text="")
+                elif msg_type == 'status_update':
+                    # 狀態更新
+                    self.status_var.set(data)
                 
         except queue.Empty:
             pass
@@ -769,678 +817,44 @@ class CSEClientGUI:
             # 3秒後自動關閉
             notification.after(3000, notification.destroy)
     
+    # ===== 自動更新方法 =====
+    
     def _start_auto_refresh(self):
         """啟動自動更新機制"""
-        self.stop_all_threads = False
-        
-        # 啟動線上使用者自動更新
-        threading.Thread(target=self._auto_refresh_online_users, daemon=True).start()
-        
-        # 啟動群組自動更新
-        threading.Thread(target=self._auto_refresh_groups, daemon=True).start()
+        self._refresh_online_users()
+        self._refresh_groups()
     
-    def _auto_refresh_online_users(self):
-        """自動更新在線使用者列表"""
-        while self.is_authenticated and not getattr(self, 'stop_all_threads', False):
-            try:
-                online_clients = self.get_online_clients()
-                self.message_queue.put(('online_users', online_clients))
-            except Exception as e:
-                self.logger.error(f"Auto refresh online users error: {e}")
+    def _refresh_online_users(self):
+        """刷新在線使用者列表"""
+        if not self.client.is_authenticated:
+            return
             
-            time.sleep(5)  # 每5秒更新一次
+        try:
+            online_clients = self.client.get_online_clients()
+            self.message_queue.put(('online_users', online_clients))
+        except Exception as e:
+            print(f"Refresh online users error: {e}")
+        
+        # 排程下次更新
+        self.refresh_timer = self.root.after(5000, self._refresh_online_users)  # 每5秒更新一次
     
-    def _auto_refresh_groups(self):
-        """自動更新群組列表"""
-        while self.is_authenticated and not getattr(self, 'stop_all_threads', False):
-            try:
-                self._get_my_groups()
-                self.message_queue.put(('groups_refreshed', self.groups))
-            except Exception as e:
-                self.logger.error(f"Auto refresh groups error: {e}")
+    def _refresh_groups(self):
+        """刷新群組列表"""
+        if not self.client.is_authenticated:
+            return
             
-            time.sleep(10)  # 每10秒更新一次
+        try:
+            groups = self.client.get_my_groups()
+            self.message_queue.put(('groups_refreshed', groups))
+        except Exception as e:
+            print(f"Refresh groups error: {e}")
+        
+        # 排程下次更新
+        self.root.after(10000, self._refresh_groups)  # 每10秒更新一次
     
     def run(self):
         """啟動 GUI"""
         self.root.mainloop()
-    
-    # ===== 後端方法（從原始 client.py 移植） =====
-    
-    def discover_services(self, passphrase, timeout=30):
-        """通過廣播發現服務"""
-        self.logger.info("Starting service discovery...")
-        self.stop_discovery = False
-        
-        # 啟動監聽線程
-        listen_thread = threading.Thread(
-            target=self._listen_for_server_broadcast, 
-            args=(passphrase,)
-        )
-        listen_thread.daemon = True
-        listen_thread.start()
-        
-        # 等待服務發現完成
-        if self.service_discovered.wait(timeout):
-            self.logger.info("Service discovery completed successfully")
-            self.stop_discovery = True
-            listen_thread.join(timeout=2)
-            return True
-        else:
-            self.logger.error("Service discovery timeout")
-            self.stop_discovery = True
-            return False
-    
-    def _listen_for_server_broadcast(self, passphrase):
-        """監聽服務器廣播"""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.settimeout(1.0)
-        sock.bind(('', NetworkUtils.BROADCAST_PORT))
-        
-        while not self.stop_discovery:
-            try:
-                data, addr = sock.recvfrom(4096)
-                broadcast_data = json.loads(data.decode('utf-8'))
-                
-                # 解密廣播訊息
-                key = CryptoUtils.derive_key_from_passphrase(passphrase)
-                try:
-                    decrypted_msg = CryptoUtils.decrypt_aes_gcm(key, broadcast_data['encrypted'])
-                    message = json.loads(decrypted_msg)
-                    
-                    if message.get('type') == 'service_announcement' and message.get('role') == 'server':
-                        if self.service_discovered.is_set():
-                            continue
-                            
-                        self.logger.info(f"Discovered server at {addr[0]}")
-                        self._respond_to_server(addr[0], message, passphrase)
-                except Exception:
-                    pass
-                    
-            except socket.timeout:
-                continue
-            except Exception as e:
-                if not self.stop_discovery:
-                    self.logger.error(f"Error in broadcast listener: {e}")
-        
-        sock.close()
-        self.logger.info("Stopped listening for server broadcasts")
-    
-    def _respond_to_server(self, server_addr, server_message, passphrase):
-        """響應服務器廣播並獲取所有服務信息 - 加密版本"""
-        if self.service_discovered.is_set():
-            return
-            
-        time.sleep(0.5)
-        
-        server_public_key = CryptoUtils.deserialize_public_key(server_message.get('public_key'))
-        
-        response = {
-            'type': 'client_discovery',
-            'client_id': self.client_id,
-            'public_key': CryptoUtils.serialize_public_key(self.client_public_key)
-        }
-        
-        try:
-            # 使用加密通道
-            result = NetworkUtils.send_tcp_message(
-                server_addr,
-                server_message.get('port'),
-                response,
-                encrypt_with_public_key=server_public_key,
-                sign_with_private_key=self.client_private_key
-            )
-            
-            if result and result.get('status') == 'success':
-                services_info = result.get('services', {})
-                
-                self.services['server'] = {
-                    'address': server_addr,
-                    'public_key': server_public_key
-                }
-                
-                for role, info in services_info.items():
-                    self.services[role] = {
-                        'address': info['address'],
-                        'public_key': CryptoUtils.deserialize_public_key(info['public_key'])
-                    }
-                
-                self.logger.info(f"Discovered services: {list(self.services.keys())}")
-                
-                if all(role in self.services for role in ['server', 'idp', 'kacls']):
-                    self.service_discovered.set()
-                else:
-                    self.logger.warning("Not all services discovered")
-            else:
-                self.logger.error(f"Server response was not successful: {result}")
-        except Exception as e:
-            self.logger.error(f"Failed to respond to server: {e}")
-    
-    def get_service_address(self, role):
-        """獲取服務地址"""
-        if role in self.services:
-            return self.services[role]['address']
-        return None
-    
-    def register(self, password):
-        """向IdP註冊 - 加密版本"""
-        idp_host = self.get_service_address('idp')
-        if not idp_host:
-            self.logger.error("IdP service not discovered")
-            return False
-            
-        request = {
-            'type': 'register',
-            'client_id': self.client_id,
-            'password': password,
-            'client_public_key': CryptoUtils.serialize_public_key(self.client_public_key)
-        }
-        
-        # 使用加密通道
-        response = NetworkUtils.send_tcp_message(
-            idp_host, 
-            self.idp_port, 
-            request,
-            encrypt_with_public_key=self.services['idp']['public_key'],
-            sign_with_private_key=self.client_private_key
-        )
-        
-        if response.get('status') == 'success':
-            self.three_p_jwt = response.get('3p_jwt')
-            self.logger.info("Registration successful")
-            return True
-        else:
-            self.logger.error(f"Registration failed: {response.get('message')}")
-            return False
-    
-    def authenticate(self, password):
-        """向IdP認證 - 加密版本"""
-        idp_host = self.get_service_address('idp')
-        if not idp_host:
-            self.logger.error("IdP service not discovered")
-            return False
-            
-        # 第一步：送出密碼請求，等待挑戰或直接成功
-        first_req = {
-            'type': 'authenticate',
-            'client_id': self.client_id,
-            'password': password
-        }
-        first_resp = NetworkUtils.send_tcp_message(
-            idp_host,
-            self.idp_port,
-            first_req,
-            encrypt_with_public_key=self.services['idp']['public_key'],
-            sign_with_private_key=self.client_private_key
-        )
-
-
-        # 如果收到 challenge，就進行第二步：簽名後回傳
-        if first_resp.get('status') == 'challenge':
-            challenge_b64 = first_resp.get('challenge')
-            # 用私鑰簽名挑戰
-            signature = CryptoUtils.sign_data(self.client_private_key, challenge_b64)
-            second_req = {
-                'type': 'auth_challenge_response',
-                'client_id': self.client_id,
-                'signed_challenge': signature
-            }
-            second_resp = NetworkUtils.send_tcp_message(
-                idp_host,
-                self.idp_port,
-                second_req,
-                encrypt_with_public_key=self.services['idp']['public_key'],
-                sign_with_private_key=self.client_private_key
-            )
-            if second_resp.get('status') == 'success':
-                self.three_p_jwt = second_resp.get('3p_jwt')
-                self.is_authenticated = True
-                self.logger.info("Authentication successful (after challenge)")
-                # 向Server註冊、取得群組並啟動心跳／訊息檢查
-                self._register_with_server()
-                self._get_my_groups()
-                self._start_heartbeat()
-                self._start_message_checker()
-                return True
-            else:
-                self.logger.error(f"Challenge-response failed: {second_resp.get('message')}")
-                return False
-
-        # 其他錯誤狀況
-        self.logger.error(f"Authentication failed: {first_resp.get('message')}")
-        return False
-    
-    def _register_with_server(self):
-        """向Server註冊 - 加密版本"""
-        server_host = self.get_service_address('server')
-        if not server_host:
-            self.logger.error("Server service not discovered")
-            return
-            
-        request = {
-            'type': 'register_client',
-            'client_id': self.client_id,
-            '3p_jwt': self.three_p_jwt,
-            'public_key': CryptoUtils.serialize_public_key(self.client_public_key)
-        }
-        
-        # 使用加密通道
-        response = NetworkUtils.send_tcp_message(
-            server_host, 
-            self.server_port, 
-            request,
-            encrypt_with_public_key=self.services['server']['public_key'],
-            sign_with_private_key=self.client_private_key
-        )
-        
-        if response.get('status') == 'success':
-            self.logger.info("Registered with server")
-        else:
-            self.logger.error(f"Server registration failed: {response.get('message')}")
-
-    def _start_heartbeat(self):
-        """啟動心跳線程 - 加密版本"""
-        def heartbeat():
-            server_host = self.get_service_address('server')
-            while self.is_authenticated and server_host and not getattr(self, 'stop_all_threads', False):
-                request = {
-                    'type': 'heartbeat',
-                    'client_id': self.client_id
-                }
-                try:
-                    NetworkUtils.send_tcp_message(
-                        server_host, 
-                        self.server_port, 
-                        request,
-                        encrypt_with_public_key=self.services['server']['public_key'],
-                        sign_with_private_key=self.client_private_key
-                    )
-                except Exception as e:
-                    self.logger.error(f"Heartbeat failed: {e}")
-                time.sleep(60)
-        
-        heartbeat_thread = threading.Thread(target=heartbeat)
-        heartbeat_thread.daemon = True
-        heartbeat_thread.start()
-    
-    def _start_message_checker(self):
-        """啟動訊息檢查線程 - 加密版本"""
-        def check_messages():
-            server_host = self.get_service_address('server')
-            while self.is_authenticated and server_host and not getattr(self, 'stop_all_threads', False):
-                try:
-                    request = {
-                        'type': 'check_messages',
-                        'client_id': self.client_id
-                    }
-                    
-                    response = NetworkUtils.send_tcp_message(
-                        server_host, 
-                        self.server_port, 
-                        request,
-                        encrypt_with_public_key=self.services['server']['public_key'],
-                        sign_with_private_key=self.client_private_key
-                    )
-                    
-                    if response.get('status') == 'success':
-                        new_messages = response.get('new_messages', [])
-                        
-                        if new_messages:
-                            # 更新新訊息計數
-                            with self.message_lock:
-                                self.new_messages.extend(new_messages)
-                                self.message_queue.put(('new_message_count', len(self.new_messages)))
-                            
-                            # 處理每個新訊息
-                            for msg_info in new_messages:
-                                if msg_info.get('type') == 'group_invite':
-                                    # 處理群組邀請
-                                    group_id = msg_info['group_id']
-                                    
-                                    # 先加入基本資訊
-                                    self.groups[group_id] = {
-                                        'name': msg_info['group_name'],
-                                        'members': []
-                                    }
-                                    
-                                    # 獲取完整群組資訊
-                                    request = {
-                                        'type': 'get_group_info',
-                                        'client_id': self.client_id,
-                                        'group_id': group_id
-                                    }
-                                    response = NetworkUtils.send_tcp_message(
-                                        server_host, 
-                                        self.server_port, 
-                                        request,
-                                        encrypt_with_public_key=self.services['server']['public_key'],
-                                        sign_with_private_key=self.client_private_key
-                                    )
-                                    
-                                    if response.get('status') == 'success':
-                                        group_info = response.get('group')
-                                        self.groups[group_id]['members'] = group_info['members']
-                                    
-                                    # 發送通知
-                                    self.message_queue.put((
-                                        'group_invite',
-                                        (group_id, msg_info['group_name'], msg_info['invited_by'])
-                                    ))
-                                else:
-                                    # 自動讀取並解密訊息
-                                    threading.Thread(
-                                        target=self._process_new_message,
-                                        args=(msg_info,),
-                                        daemon=True
-                                    ).start()
-                            
-                            # 清除已處理的訊息
-                            with self.message_lock:
-                                self.new_messages.clear()
-                                self.message_queue.put(('new_message_count', 0))
-                            
-                except Exception as e:
-                    self.logger.error(f"Message check failed: {e}")
-                
-                time.sleep(3)  # 每3秒檢查一次新訊息
-        
-        message_check_thread = threading.Thread(target=check_messages)
-        message_check_thread.daemon = True
-        message_check_thread.start()
-    
-    def _process_new_message(self, msg_info):
-        """處理新訊息 - 加密版本"""
-        try:
-            server_host = self.get_service_address('server')
-            if not server_host:
-                return
-            
-            # 認領訊息
-            claim_request = {
-                'type': 'claim_message',
-                'client_id': self.client_id,
-                'message_id': msg_info['message_id']
-            }
-            
-            response = NetworkUtils.send_tcp_message(
-                server_host, 
-                self.server_port, 
-                claim_request,
-                encrypt_with_public_key=self.services['server']['public_key'],
-                sign_with_private_key=self.client_private_key
-            )
-            
-            # 處理挑戰
-            if response.get('status') == 'challenge':
-                challenge = response.get('challenge')
-                claim_request['challenge_response'] = challenge
-                response = NetworkUtils.send_tcp_message(
-                    server_host, 
-                    self.server_port, 
-                    claim_request,
-                    encrypt_with_public_key=self.services['server']['public_key'],
-                    sign_with_private_key=self.client_private_key
-                )
-            
-            if response.get('status') == 'success':
-                b_jwt = response.get('b_jwt')
-                
-                # 使用 B_JWT 接收並解密訊息
-                decrypted = self.receive_message(msg_info['message_id'], b_jwt)
-                
-                if decrypted:
-                    # 將訊息加入訊息佇列顯示
-                    timestamp = datetime.fromisoformat(decrypted['timestamp']).strftime('%H:%M:%S')
-                    
-                    group_info = {}
-                    if decrypted.get('group_id'):
-                        group_info = {
-                            'group_id': decrypted['group_id'],
-                            'group_name': decrypted.get('group_name', '')
-                        }
-                    
-                    self.message_queue.put((
-                        'new_message',
-                        (
-                            decrypted['from'],
-                            decrypted['message'],
-                            timestamp,
-                            bool(decrypted.get('group_id')),
-                            group_info
-                        )
-                    ))
-        except Exception as e:
-            self.logger.error(f"Process new message error: {e}")
-    
-    def get_online_clients(self):
-        """獲取在線客戶端列表 - 加密版本"""
-        server_host = self.get_service_address('server')
-        if not server_host:
-            self.logger.error("Server service not discovered")
-            return []
-            
-        request = {
-            'type': 'get_online_clients',
-            'client_id': self.client_id
-        }
-        
-        response = NetworkUtils.send_tcp_message(
-            server_host, 
-            self.server_port, 
-            request,
-            encrypt_with_public_key=self.services['server']['public_key'],
-            sign_with_private_key=self.client_private_key
-        )
-        
-        if response.get('status') == 'success':
-            return response.get('online_clients', [])
-        else:
-            self.logger.error(f"Failed to get online clients: {response.get('message')}")
-            return []
-    
-    def create_group(self, group_name, member_ids):
-        """創建群組 - 加密版本"""
-        server_host = self.get_service_address('server')
-        if not server_host:
-            self.logger.error("Server service not discovered")
-            return False, "Server not available"
-            
-        request = {
-            'type': 'create_group',
-            'client_id': self.client_id,
-            'group_name': group_name,
-            'members': member_ids
-        }
-        
-        response = NetworkUtils.send_tcp_message(
-            server_host, 
-            self.server_port, 
-            request,
-            encrypt_with_public_key=self.services['server']['public_key'],
-            sign_with_private_key=self.client_private_key
-        )
-        
-        if response.get('status') == 'success':
-            group_id = response.get('group_id')
-            self.groups[group_id] = {
-                'name': group_name,
-                'members': member_ids
-            }
-            self.logger.info(f"Group '{group_name}' created with ID: {group_id}")
-            return True, group_id
-        else:
-            self.logger.error(f"Failed to create group: {response.get('message')}")
-            return False, response.get('message')
-        
-    def _get_my_groups(self):
-        """獲取已加入的群組 - 加密版本"""
-        server_host = self.get_service_address('server')
-        if not server_host:
-            return
-            
-        request = {
-            'type': 'get_my_groups',
-            'client_id': self.client_id
-        }
-        
-        response = NetworkUtils.send_tcp_message(
-            server_host, 
-            self.server_port, 
-            request,
-            encrypt_with_public_key=self.services['server']['public_key'],
-            sign_with_private_key=self.client_private_key
-        )
-        
-        if response.get('status') == 'success':
-            self.groups = response.get('groups', {})
-            self.logger.info(f"Retrieved {len(self.groups)} groups")
-        else:
-            self.logger.error(f"Failed to get groups: {response.get('message')}")
-
-    def send_message_backend(self, receiver_id, message, is_group=False):
-        """發送加密訊息 - 加密版本"""
-        kacls_host = self.get_service_address('kacls')
-        server_host = self.get_service_address('server')
-        
-        if not kacls_host or not server_host:
-            self.logger.error("Required services not discovered")
-            return False
-            
-        # 生成DEK
-        dek = CryptoUtils.generate_aes_key()
-        
-        # 加密訊息
-        encrypted_message = CryptoUtils.encrypt_aes_gcm(dek, message)
-        
-        # 向KACLS請求包裝DEK - 使用加密通道
-        if is_group:
-            group_members = self.groups.get(receiver_id, {}).get('members', [])
-            wrap_request = {
-                'type': 'wrap_dek',
-                '3p_jwt': self.three_p_jwt,
-                'dek': base64.b64encode(dek).decode('utf-8'),
-                'client_id': self.client_id,
-                'receivers': group_members,
-                'is_group': True,
-                'group_id': receiver_id
-            }
-        else:
-            wrap_request = {
-                'type': 'wrap_dek',
-                '3p_jwt': self.three_p_jwt,
-                'dek': base64.b64encode(dek).decode('utf-8'),
-                'client_id': self.client_id,
-                'receivers': [receiver_id]
-            }
-        
-        wrap_response = NetworkUtils.send_tcp_message(
-            kacls_host, 
-            self.kacls_port, 
-            wrap_request,
-            encrypt_with_public_key=self.services['kacls']['public_key'],
-            sign_with_private_key=self.client_private_key
-        )
-        
-        if wrap_response.get('status') != 'success':
-            self.logger.error(f"Failed to wrap DEK: {wrap_response.get('message')}")
-            return False
-        
-        w_dek = wrap_response.get('w_dek')
-        
-        # 發送加密訊息到Server - 使用加密通道
-        send_request = {
-            'type': 'send_group_message' if is_group else 'send_message',
-            'sender_id': self.client_id,
-            'receiver_id': receiver_id,
-            'encrypted_data': encrypted_message,
-            'w_dek': w_dek
-        }
-        
-        send_response = NetworkUtils.send_tcp_message(
-            server_host, 
-            self.server_port, 
-            send_request,
-            encrypt_with_public_key=self.services['server']['public_key'],
-            sign_with_private_key=self.client_private_key
-        )
-        
-        if send_response.get('status') == 'success':
-            target_type = "group" if is_group else "user"
-            self.logger.info(f"Message sent to {target_type} {receiver_id}")
-            return True
-        else:
-            self.logger.error(f"Failed to send message: {send_response.get('message')}")
-            return False
-        
-    def receive_message(self, message_id, b_jwt):
-        """接收並解密訊息 - 加密版本"""
-        server_host = self.get_service_address('server')
-        kacls_host = self.get_service_address('kacls')
-        
-        if not server_host or not kacls_host:
-            self.logger.error("Required services not discovered")
-            return None
-            
-        # 從Server獲取訊息 - 使用加密通道
-        get_request = {
-            'type': 'get_message',
-            'client_id': self.client_id,
-            'message_id': message_id,
-            'b_jwt': b_jwt
-        }
-        
-        get_response = NetworkUtils.send_tcp_message(
-            server_host, 
-            self.server_port, 
-            get_request,
-            encrypt_with_public_key=self.services['server']['public_key'],
-            sign_with_private_key=self.client_private_key
-        )
-        
-        if get_response.get('status') != 'success':
-            self.logger.error(f"Failed to get message: {get_response.get('message')}")
-            return None
-        
-        message_data = get_response.get('message')
-        
-        # 向KACLS請求解包DEK - 使用加密通道
-        unwrap_request = {
-            'type': 'unwrap_dek',
-            '3p_jwt': self.three_p_jwt,
-            'b_jwt': b_jwt,
-            'w_dek': message_data['w_dek'],
-            'client_id': self.client_id
-        }
-        
-        unwrap_response = NetworkUtils.send_tcp_message(
-            kacls_host, 
-            self.kacls_port, 
-            unwrap_request,
-            encrypt_with_public_key=self.services['kacls']['public_key'],
-            sign_with_private_key=self.client_private_key
-        )
-        
-        if unwrap_response.get('status') != 'success':
-            self.logger.error(f"Failed to unwrap DEK: {unwrap_response.get('message')}")
-            return None
-        
-        dek = base64.b64decode(unwrap_response.get('dek'))
-        
-        # 解密訊息
-        try:
-            decrypted_message = CryptoUtils.decrypt_aes_gcm(dek, message_data['data'])
-            self.logger.info(f"Message received from {message_data['from']}")
-            return {
-                'from': message_data['from'],
-                'message': decrypted_message,
-                'timestamp': message_data['timestamp'],
-                'group_id': message_data.get('group_id'),
-                'group_name': message_data.get('group_name')
-            }
-        except Exception as e:
-            self.logger.error(f"Failed to decrypt message: {e}")
-            return None
 
 
 def main():
@@ -1449,8 +863,8 @@ def main():
         sys.exit(1)
     
     client_id = sys.argv[1]
-    client = CSEClientGUI(client_id)
-    client.run()
+    gui = CSEClientGUI(client_id)
+    gui.run()
 
 
 if __name__ == "__main__":
