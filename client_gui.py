@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """
-CSE Communication System - GUI Client Frontend Component
-圖形化客戶端前端應用程式 - 處理UI顯示和使用者互動
-修改版：支援在GUI中輸入用戶名稱
+CSE Communication System - GUI Client Frontend Component with CustomTkinter
+圖形化客戶端前端應用程式 - 使用現代化的 CustomTkinter UI
 """
 
-import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+import customtkinter as ctk
+from tkinter import messagebox
 import threading
 import queue
 import sys
 from datetime import datetime
 from client import CSEClient
 
+# 設定外觀模式和主題
+ctk.set_appearance_mode("dark")  # 可選 "light", "dark", "system"
+ctk.set_default_color_theme("blue")  # 可選 "blue", "green", "dark-blue"
+
 class CSEClientGUI:
     def __init__(self):
-        # 初始化基本屬性（但還沒有client_id）
+        # 初始化基本屬性
         self.client_id = None
         self.client = None
         
@@ -29,13 +32,12 @@ class CSEClientGUI:
         self.current_group_name = None
         
         # 建立主視窗
-        self.root = tk.Tk()
+        self.root = ctk.CTk()
         self.root.title("CSE Client")
-        self.root.geometry("900x700")
+        self.root.geometry("1000x700")
         
-        # 設定樣式
-        self.style = ttk.Style()
-        self.style.theme_use('clam')
+        # 設定視窗最小尺寸
+        self.root.minsize(800, 600)
         
         # 初始化 UI
         self.setup_ui()
@@ -46,108 +48,391 @@ class CSEClientGUI:
         # 啟動定期更新線程
         self.refresh_timer = None
         
-        print("Client GUI initialized")
+        print("Client GUI initialized with CustomTkinter")
     
     def setup_ui(self):
         """設定使用者介面"""
-        # 創建筆記本（分頁）
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        # 創建主框架
+        self.main_frame = ctk.CTkFrame(self.root)
+        self.main_frame.pack(fill="both", expand=True, padx=10, pady=10)
         
-        # 連線分頁
-        self.connection_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.connection_frame, text="連線")
+        # 創建分頁視圖
+        self.tabview = ctk.CTkTabview(self.main_frame)
+        self.tabview.pack(fill="both", expand=True)
+        
+        # 添加分頁
+        self.connection_tab = self.tabview.add("連線")
+        self.chat_tab = self.tabview.add("聊天")
+        self.group_tab = self.tabview.add("群組")
+        
+        # 設定各分頁內容
         self.setup_connection_tab()
-        
-        # 聊天分頁
-        self.chat_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.chat_frame, text="聊天", state='disabled')
         self.setup_chat_tab()
-        
-        # 群組分頁
-        self.group_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.group_frame, text="群組", state='disabled')
         self.setup_group_tab()
         
-        # 狀態列
-        self.status_frame = ttk.Frame(self.root)
-        self.status_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        # 初始時禁用聊天和群組分頁
+        self.tabview._segmented_button.configure(state="normal")
+        self.disable_tabs()
         
-        self.status_var = tk.StringVar()
-        self.status_var.set("未連線")
-        self.status_bar = ttk.Label(self.status_frame, textvariable=self.status_var, relief=tk.SUNKEN)
-        self.status_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        # 狀態列
+        self.setup_status_bar()
+    
+    def setup_status_bar(self):
+        """設定狀態列"""
+        self.status_frame = ctk.CTkFrame(self.root, height=30)
+        self.status_frame.pack(side="bottom", fill="x", padx=10, pady=(0, 10))
+        
+        self.status_label = ctk.CTkLabel(
+            self.status_frame, 
+            text="未連線",
+            font=ctk.CTkFont(size=12)
+        )
+        self.status_label.pack(side="left", padx=10)
         
         # 新訊息指示器
-        self.new_msg_indicator = ttk.Label(self.status_frame, text="", foreground="red", font=('Arial', 10, 'bold'))
-        self.new_msg_indicator.pack(side=tk.RIGHT, padx=10)
+        self.new_msg_indicator = ctk.CTkLabel(
+            self.status_frame,
+            text="",
+            text_color="red",
+            font=ctk.CTkFont(size=12, weight="bold")
+        )
+        self.new_msg_indicator.pack(side="right", padx=10)
     
     def setup_connection_tab(self):
         """設定連線分頁"""
+        # 創建滾動框架
+        self.connection_scroll = ctk.CTkScrollableFrame(self.connection_tab)
+        self.connection_scroll.pack(fill="both", expand=True, padx=20, pady=20)
+        
         # 用戶登入區域
-        user_frame = ttk.LabelFrame(self.connection_frame, text="用戶資訊", padding=10)
-        user_frame.pack(fill=tk.X, padx=10, pady=10)
+        user_frame = ctk.CTkFrame(self.connection_scroll)
+        user_frame.pack(fill="x", pady=(0, 20))
         
-        ttk.Label(user_frame, text="用戶名稱:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
-        self.username_var = tk.StringVar()
-        self.username_entry = ttk.Entry(user_frame, textvariable=self.username_var, width=30)
-        self.username_entry.grid(row=0, column=1, padx=5, pady=5)
-        self.username_entry.focus()  # 預設焦點
+        ctk.CTkLabel(
+            user_frame, 
+            text="用戶資訊", 
+            font=ctk.CTkFont(size=16, weight="bold")
+        ).pack(pady=(10, 5))
         
-        # 用戶名稱確認按鈕
-        self.set_username_btn = ttk.Button(user_frame, text="設定用戶名稱", command=self.set_username)
-        self.set_username_btn.grid(row=0, column=2, padx=5, pady=5)
+        # 用戶名稱輸入
+        username_container = ctk.CTkFrame(user_frame)
+        username_container.pack(fill="x", padx=20, pady=10)
+        
+        ctk.CTkLabel(username_container, text="用戶名稱:").pack(side="left", padx=(0, 10))
+        
+        self.username_entry = ctk.CTkEntry(
+            username_container,
+            placeholder_text="請輸入用戶名稱",
+            width=200
+        )
+        self.username_entry.pack(side="left", padx=(0, 10))
+        self.username_entry.focus()
+        
+        self.set_username_btn = ctk.CTkButton(
+            username_container,
+            text="設定用戶名稱",
+            command=self.set_username,
+            width=120
+        )
+        self.set_username_btn.pack(side="left")
         
         # 顯示當前用戶
-        self.current_user_label = ttk.Label(user_frame, text="", font=('Arial', 10, 'bold'), foreground='blue')
-        self.current_user_label.grid(row=1, column=0, columnspan=3, padx=5, pady=5)
+        self.current_user_label = ctk.CTkLabel(
+            user_frame,
+            text="",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color=("blue", "lightblue")
+        )
+        self.current_user_label.pack(pady=(5, 10))
         
-        # 服務發現區域（初始為禁用）
-        self.discovery_frame = ttk.LabelFrame(self.connection_frame, text="服務發現", padding=10)
-        self.discovery_frame.pack(fill=tk.X, padx=10, pady=10)
+        # 服務發現區域
+        self.discovery_frame = ctk.CTkFrame(self.connection_scroll)
+        self.discovery_frame.pack(fill="x", pady=(0, 20))
         
-        ttk.Label(self.discovery_frame, text="通關密語:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
-        self.passphrase_var = tk.StringVar()
-        self.passphrase_entry = ttk.Entry(self.discovery_frame, textvariable=self.passphrase_var, width=30, show="*", state='disabled')
-        self.passphrase_entry.grid(row=0, column=1, padx=5, pady=5)
+        ctk.CTkLabel(
+            self.discovery_frame,
+            text="服務發現",
+            font=ctk.CTkFont(size=16, weight="bold")
+        ).pack(pady=(10, 5))
         
-        self.discover_btn = ttk.Button(self.discovery_frame, text="發現服務", command=self.discover_services_async, state='disabled')
-        self.discover_btn.grid(row=0, column=2, padx=5, pady=5)
+        # 通關密語輸入
+        passphrase_container = ctk.CTkFrame(self.discovery_frame)
+        passphrase_container.pack(fill="x", padx=20, pady=10)
+        
+        ctk.CTkLabel(passphrase_container, text="通關密語:").pack(side="left", padx=(0, 10))
+        
+        self.passphrase_entry = ctk.CTkEntry(
+            passphrase_container,
+            placeholder_text="請輸入通關密語",
+            show="*",
+            width=200,
+            state="disabled"
+        )
+        self.passphrase_entry.pack(side="left", padx=(0, 10))
+        
+        self.discover_btn = ctk.CTkButton(
+            passphrase_container,
+            text="發現服務",
+            command=self.discover_services_async,
+            width=120,
+            state="disabled"
+        )
+        self.discover_btn.pack(side="left")
         
         # 服務狀態顯示
-        self.service_status_text = scrolledtext.ScrolledText(self.discovery_frame, height=5, width=50, state='disabled')
-        self.service_status_text.grid(row=1, column=0, columnspan=3, padx=5, pady=5)
+        self.service_status_text = ctk.CTkTextbox(
+            self.discovery_frame,
+            height=100,
+            state="disabled"
+        )
+        self.service_status_text.pack(fill="x", padx=20, pady=(0, 10))
         
-        # 登入/註冊區域（初始為禁用）
-        self.auth_frame = ttk.LabelFrame(self.connection_frame, text="身份驗證", padding=10)
-        self.auth_frame.pack(fill=tk.X, padx=10, pady=10)
+        # 身份驗證區域
+        self.auth_frame = ctk.CTkFrame(self.connection_scroll)
+        self.auth_frame.pack(fill="x")
         
-        ttk.Label(self.auth_frame, text="密碼:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
-        self.password_var = tk.StringVar()
-        self.password_entry = ttk.Entry(self.auth_frame, textvariable=self.password_var, width=30, show="*", state='disabled')
-        self.password_entry.grid(row=0, column=1, padx=5, pady=5)
+        ctk.CTkLabel(
+            self.auth_frame,
+            text="身份驗證",
+            font=ctk.CTkFont(size=16, weight="bold")
+        ).pack(pady=(10, 5))
         
-        self.register_btn = ttk.Button(self.auth_frame, text="註冊", command=self.register_async, state='disabled')
-        self.register_btn.grid(row=1, column=0, padx=5, pady=5)
+        # 密碼輸入
+        password_container = ctk.CTkFrame(self.auth_frame)
+        password_container.pack(fill="x", padx=20, pady=10)
         
-        self.login_btn = ttk.Button(self.auth_frame, text="登入", command=self.login_async, state='disabled')
-        self.login_btn.grid(row=1, column=1, padx=5, pady=5)
+        ctk.CTkLabel(password_container, text="密碼:").pack(side="left", padx=(0, 10))
         
-        self.logout_btn = ttk.Button(self.auth_frame, text="登出", command=self.logout, state='disabled')
-        self.logout_btn.grid(row=1, column=2, padx=5, pady=5)
+        self.password_entry = ctk.CTkEntry(
+            password_container,
+            placeholder_text="請輸入密碼",
+            show="*",
+            width=200,
+            state="disabled"
+        )
+        self.password_entry.pack(side="left", padx=(0, 10))
+        
+        # 按鈕區域
+        button_container = ctk.CTkFrame(self.auth_frame)
+        button_container.pack(pady=10)
+        
+        self.register_btn = ctk.CTkButton(
+            button_container,
+            text="註冊",
+            command=self.register_async,
+            width=100,
+            state="disabled"
+        )
+        self.register_btn.pack(side="left", padx=5)
+        
+        self.login_btn = ctk.CTkButton(
+            button_container,
+            text="登入",
+            command=self.login_async,
+            width=100,
+            state="disabled"
+        )
+        self.login_btn.pack(side="left", padx=5)
+        
+        self.logout_btn = ctk.CTkButton(
+            button_container,
+            text="登出",
+            command=self.logout,
+            width=100,
+            state="disabled",
+            fg_color="red",
+            hover_color="darkred"
+        )
+        self.logout_btn.pack(side="left", padx=5)
         
         # 認證狀態顯示
-        self.auth_status_label = ttk.Label(self.auth_frame, text="", foreground="blue")
-        self.auth_status_label.grid(row=2, column=0, columnspan=3, padx=5, pady=5)
+        self.auth_status_label = ctk.CTkLabel(
+            self.auth_frame,
+            text="",
+            text_color=("blue", "lightblue")
+        )
+        self.auth_status_label.pack(pady=(5, 10))
         
         # 設定Enter鍵綁定
         self.username_entry.bind('<Return>', lambda e: self.set_username())
         self.passphrase_entry.bind('<Return>', lambda e: self.discover_services_async())
         self.password_entry.bind('<Return>', lambda e: self.login_async())
     
+    def setup_chat_tab(self):
+        """設定聊天分頁"""
+        # 主要容器
+        chat_container = ctk.CTkFrame(self.chat_tab)
+        chat_container.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # 左側：在線使用者列表
+        left_frame = ctk.CTkFrame(chat_container, width=200)
+        left_frame.pack(side="left", fill="y", padx=(0, 10))
+        left_frame.pack_propagate(False)
+        
+        ctk.CTkLabel(
+            left_frame,
+            text="在線使用者",
+            font=ctk.CTkFont(size=14, weight="bold")
+        ).pack(pady=10)
+        
+        # 使用 CTkScrollableFrame 替代 Listbox
+        self.online_users_frame = ctk.CTkScrollableFrame(left_frame)
+        self.online_users_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        self.online_user_buttons = {}  # 儲存使用者按鈕
+        
+        # 右側：聊天區域
+        right_frame = ctk.CTkFrame(chat_container)
+        right_frame.pack(side="right", fill="both", expand=True)
+        
+        # 聊天對象標題
+        self.chat_target_label = ctk.CTkLabel(
+            right_frame,
+            text="請選擇聊天對象",
+            font=ctk.CTkFont(size=16, weight="bold")
+        )
+        self.chat_target_label.pack(pady=10)
+        
+        # 聊天記錄顯示
+        self.chat_display = ctk.CTkTextbox(
+            right_frame,
+            wrap="word",
+            state="disabled"
+        )
+        self.chat_display.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        
+        # 輸入區域
+        input_frame = ctk.CTkFrame(right_frame)
+        input_frame.pack(fill="x", padx=10, pady=(0, 10))
+        
+        self.message_entry = ctk.CTkEntry(
+            input_frame,
+            placeholder_text="輸入訊息...",
+            font=ctk.CTkFont(size=12)
+        )
+        self.message_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.message_entry.bind('<Return>', lambda e: self.send_message())
+        
+        self.send_btn = ctk.CTkButton(
+            input_frame,
+            text="發送",
+            command=self.send_message,
+            width=80
+        )
+        self.send_btn.pack(side="right")
+    
+    def setup_group_tab(self):
+        """設定群組分頁"""
+        # 主要容器
+        group_container = ctk.CTkFrame(self.group_tab)
+        group_container.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # 左側：群組列表
+        left_frame = ctk.CTkFrame(group_container, width=250)
+        left_frame.pack(side="left", fill="y", padx=(0, 10))
+        left_frame.pack_propagate(False)
+        
+        # 群組標題和創建按鈕
+        header_frame = ctk.CTkFrame(left_frame)
+        header_frame.pack(fill="x", pady=10, padx=10)
+        
+        ctk.CTkLabel(
+            header_frame,
+            text="我的群組",
+            font=ctk.CTkFont(size=14, weight="bold")
+        ).pack(side="left")
+        
+        self.create_group_btn = ctk.CTkButton(
+            header_frame,
+            text="➕",
+            width=30,
+            height=30,
+            command=self.create_group_dialog
+        )
+        self.create_group_btn.pack(side="right")
+        
+        # 群組列表
+        self.group_list_frame = ctk.CTkScrollableFrame(left_frame)
+        self.group_list_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        self.group_buttons = {}  # 儲存群組按鈕
+        
+        # 右側：群組聊天
+        right_frame = ctk.CTkFrame(group_container)
+        right_frame.pack(side="right", fill="both", expand=True)
+        
+        # 群組資訊
+        self.group_info_label = ctk.CTkLabel(
+            right_frame,
+            text="請選擇群組",
+            font=ctk.CTkFont(size=16, weight="bold")
+        )
+        self.group_info_label.pack(pady=5)
+        
+        self.group_members_label = ctk.CTkLabel(
+            right_frame,
+            text="",
+            font=ctk.CTkFont(size=12)
+        )
+        self.group_members_label.pack(pady=(0, 10))
+        
+        # 群組聊天記錄
+        self.group_chat_display = ctk.CTkTextbox(
+            right_frame,
+            wrap="word",
+            state="disabled"
+        )
+        self.group_chat_display.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        
+        # 群組訊息輸入
+        group_input_frame = ctk.CTkFrame(right_frame)
+        group_input_frame.pack(fill="x", padx=10, pady=(0, 10))
+        
+        self.group_message_entry = ctk.CTkEntry(
+            group_input_frame,
+            placeholder_text="輸入群組訊息...",
+            font=ctk.CTkFont(size=12)
+        )
+        self.group_message_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.group_message_entry.bind('<Return>', lambda e: self.send_group_message())
+        
+        self.group_send_btn = ctk.CTkButton(
+            group_input_frame,
+            text="發送",
+            command=self.send_group_message,
+            width=80
+        )
+        self.group_send_btn.pack(side="right")
+    
+    def disable_tabs(self):
+        """禁用聊天和群組分頁"""
+        # CustomTkinter 沒有直接禁用分頁的方法，所以我們禁用內容
+        for widget in self.chat_tab.winfo_children():
+            self.set_widget_state(widget, "disabled")
+        for widget in self.group_tab.winfo_children():
+            self.set_widget_state(widget, "disabled")
+    
+    def enable_tabs(self):
+        """啟用聊天和群組分頁"""
+        for widget in self.chat_tab.winfo_children():
+            self.set_widget_state(widget, "normal")
+        for widget in self.group_tab.winfo_children():
+            self.set_widget_state(widget, "normal")
+    
+    def set_widget_state(self, widget, state):
+        """遞迴設定 widget 狀態"""
+        try:
+            widget.configure(state=state)
+        except:
+            pass
+        for child in widget.winfo_children():
+            self.set_widget_state(child, state)
+    
+    # ===== 事件處理方法 =====
+    
     def set_username(self):
         """設定用戶名稱"""
-        username = self.username_var.get().strip()
+        username = self.username_entry.get().strip()
         if not username:
             messagebox.showerror("錯誤", "請輸入用戶名稱")
             return
@@ -169,142 +454,22 @@ class CSEClientGUI:
         )
         
         # 更新UI
-        self.current_user_label.config(text=f"當前用戶: {self.client_id}")
+        self.current_user_label.configure(text=f"當前用戶: {self.client_id}")
         self.root.title(f"CSE Client - {self.client_id}")
         
         # 禁用用戶名稱輸入，啟用其他功能
-        self.username_entry.config(state='disabled')
-        self.set_username_btn.config(state='disabled')
+        self.username_entry.configure(state="disabled")
+        self.set_username_btn.configure(state="disabled")
         
         # 啟用服務發現
-        self.passphrase_entry.config(state='normal')
-        self.discover_btn.config(state='normal')
-        self.service_status_text.config(state='normal')
+        self.passphrase_entry.configure(state="normal")
+        self.discover_btn.configure(state="normal")
+        self.service_status_text.configure(state="normal")
         
         # 將焦點移到通關密語
         self.passphrase_entry.focus()
         
         messagebox.showinfo("成功", f"用戶名稱已設定為: {self.client_id}")
-    
-    def setup_chat_tab(self):
-        """設定聊天分頁"""
-        # 左側：在線使用者列表
-        left_frame = ttk.Frame(self.chat_frame)
-        left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
-        
-        ttk.Label(left_frame, text="在線使用者", font=('Arial', 10, 'bold')).pack(pady=5)
-        
-        # 在線使用者列表框架
-        list_frame = ttk.Frame(left_frame)
-        list_frame.pack(fill=tk.BOTH, expand=True)
-        
-        scrollbar = ttk.Scrollbar(list_frame)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        self.online_listbox = tk.Listbox(list_frame, width=20, height=20, yscrollcommand=scrollbar.set)
-        self.online_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.online_listbox.bind('<<ListboxSelect>>', self.on_user_select)
-        scrollbar.config(command=self.online_listbox.yview)
-        
-        # 右側：聊天區域
-        right_frame = ttk.Frame(self.chat_frame)
-        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # 聊天對象
-        self.chat_target_var = tk.StringVar()
-        self.chat_target_var.set("請選擇聊天對象")
-        chat_header = ttk.Label(right_frame, textvariable=self.chat_target_var, font=('Arial', 12, 'bold'))
-        chat_header.pack(pady=5)
-        
-        # 聊天記錄
-        self.chat_display = scrolledtext.ScrolledText(right_frame, height=25, width=60, wrap=tk.WORD)
-        self.chat_display.pack(fill=tk.BOTH, expand=True, pady=5)
-        self.chat_display.config(state='disabled')
-        
-        # 設定聊天顯示標籤
-        self.chat_display.tag_config('my_message', foreground='blue')
-        self.chat_display.tag_config('other_message', foreground='green')
-        self.chat_display.tag_config('system_message', foreground='gray')
-        self.chat_display.tag_config('timestamp', foreground='gray', font=('Arial', 8))
-        
-        # 輸入區域
-        input_frame = ttk.Frame(right_frame)
-        input_frame.pack(fill=tk.X, pady=5)
-        
-        self.message_var = tk.StringVar()
-        self.message_entry = ttk.Entry(input_frame, textvariable=self.message_var, font=('Arial', 10))
-        self.message_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        self.message_entry.bind('<Return>', lambda e: self.send_message())
-        
-        self.send_btn = ttk.Button(input_frame, text="發送", command=self.send_message)
-        self.send_btn.pack(side=tk.RIGHT)
-    
-    def setup_group_tab(self):
-        """設定群組分頁"""
-        # 左側：群組列表
-        left_frame = ttk.Frame(self.group_frame)
-        left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
-        
-        # 群組標題和創建按鈕
-        header_frame = ttk.Frame(left_frame)
-        header_frame.pack(fill=tk.X, pady=5)
-        
-        ttk.Label(header_frame, text="我的群組", font=('Arial', 10, 'bold')).pack(side=tk.LEFT)
-        
-        create_group_btn = ttk.Button(header_frame, text="➕", width=3, command=self.create_group_dialog)
-        create_group_btn.pack(side=tk.RIGHT, padx=5)
-        
-        # 群組列表
-        list_frame = ttk.Frame(left_frame)
-        list_frame.pack(fill=tk.BOTH, expand=True)
-        
-        scrollbar = ttk.Scrollbar(list_frame)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        self.group_listbox = tk.Listbox(list_frame, width=30, height=20, yscrollcommand=scrollbar.set)
-        self.group_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.group_listbox.bind('<<ListboxSelect>>', self.on_group_select)
-        scrollbar.config(command=self.group_listbox.yview)
-        
-        # 右側：群組聊天
-        right_frame = ttk.Frame(self.group_frame)
-        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # 群組資訊
-        self.group_info_var = tk.StringVar()
-        self.group_info_var.set("請選擇群組")
-        group_header = ttk.Label(right_frame, textvariable=self.group_info_var, font=('Arial', 12, 'bold'))
-        group_header.pack(pady=5)
-        
-        # 群組成員顯示
-        self.group_members_var = tk.StringVar()
-        members_label = ttk.Label(right_frame, textvariable=self.group_members_var, font=('Arial', 9))
-        members_label.pack()
-        
-        # 群組聊天記錄
-        self.group_chat_display = scrolledtext.ScrolledText(right_frame, height=20, width=60, wrap=tk.WORD)
-        self.group_chat_display.pack(fill=tk.BOTH, expand=True, pady=5)
-        self.group_chat_display.config(state='disabled')
-        
-        # 設定群組聊天顯示標籤
-        self.group_chat_display.tag_config('my_message', foreground='blue')
-        self.group_chat_display.tag_config('other_message', foreground='green')
-        self.group_chat_display.tag_config('system_message', foreground='gray')
-        self.group_chat_display.tag_config('timestamp', foreground='gray', font=('Arial', 8))
-        
-        # 群組訊息輸入
-        group_input_frame = ttk.Frame(right_frame)
-        group_input_frame.pack(fill=tk.X, pady=5)
-        
-        self.group_message_var = tk.StringVar()
-        self.group_message_entry = ttk.Entry(group_input_frame, textvariable=self.group_message_var, font=('Arial', 10))
-        self.group_message_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        self.group_message_entry.bind('<Return>', lambda e: self.send_group_message())
-        
-        self.group_send_btn = ttk.Button(group_input_frame, text="發送", command=self.send_group_message)
-        self.group_send_btn.pack(side=tk.RIGHT)
-    
-    # ===== 事件處理方法 =====
     
     def discover_services_async(self):
         """非同步發現服務"""
@@ -312,14 +477,14 @@ class CSEClientGUI:
             messagebox.showerror("錯誤", "請先設定用戶名稱")
             return
             
-        passphrase = self.passphrase_var.get()
+        passphrase = self.passphrase_entry.get()
         if not passphrase:
             messagebox.showerror("錯誤", "請輸入通關密語")
             return
         
-        self.discover_btn.config(state='disabled')
-        self.service_status_text.delete(1.0, tk.END)
-        self.service_status_text.insert(tk.END, "正在發現服務...\n")
+        self.discover_btn.configure(state="disabled")
+        self.service_status_text.delete("1.0", "end")
+        self.service_status_text.insert("1.0", "正在發現服務...\n")
         
         # 在背景線程執行
         threading.Thread(target=self._discover_services_thread, args=(passphrase,), daemon=True).start()
@@ -341,7 +506,7 @@ class CSEClientGUI:
             messagebox.showerror("錯誤", "請先設定用戶名稱")
             return
             
-        password = self.password_var.get()
+        password = self.password_entry.get()
         if not password:
             messagebox.showerror("錯誤", "請輸入密碼")
             return
@@ -363,7 +528,7 @@ class CSEClientGUI:
             messagebox.showerror("錯誤", "請先設定用戶名稱")
             return
             
-        password = self.password_var.get()
+        password = self.password_entry.get()
         if not password:
             messagebox.showerror("錯誤", "請輸入密碼")
             return
@@ -373,7 +538,6 @@ class CSEClientGUI:
     def _login_thread(self, password):
         """登入線程"""
         try:
-            # 定義進度回調函數
             def progress_callback(status):
                 self.message_queue.put(('auth_status', status))
             
@@ -396,105 +560,85 @@ class CSEClientGUI:
             self.refresh_timer = None
         
         # 更新 UI
-        self.notebook.tab(1, state='disabled')
-        self.notebook.tab(2, state='disabled')
-        self.register_btn.config(state='normal')
-        self.login_btn.config(state='normal')
-        self.logout_btn.config(state='disabled')
-        self.status_var.set("已登出")
-        self.auth_status_label.config(text="")
+        self.disable_tabs()
+        self.register_btn.configure(state="normal")
+        self.login_btn.configure(state="normal")
+        self.logout_btn.configure(state="disabled")
+        self.status_label.configure(text="已登出")
+        self.auth_status_label.configure(text="")
         
         # 清空列表和聊天記錄
-        self.online_listbox.delete(0, tk.END)
-        self.group_listbox.delete(0, tk.END)
+        self.clear_online_users()
+        self.clear_groups()
         self.chat_history.clear()
         self.group_chat_history.clear()
-        self.chat_display.config(state='normal')
-        self.chat_display.delete(1.0, tk.END)
-        self.chat_display.config(state='disabled')
-        self.group_chat_display.config(state='normal')
-        self.group_chat_display.delete(1.0, tk.END)
-        self.group_chat_display.config(state='disabled')
+        self.chat_display.configure(state="normal")
+        self.chat_display.delete("1.0", "end")
+        self.chat_display.configure(state="disabled")
+        self.group_chat_display.configure(state="normal")
+        self.group_chat_display.delete("1.0", "end")
+        self.group_chat_display.configure(state="disabled")
         
         messagebox.showinfo("登出", "已成功登出")
     
-    def on_user_select(self, event):
+    def on_user_select(self, user):
         """選擇使用者事件"""
-        selection = self.online_listbox.curselection()
-        if selection:
-            user = self.online_listbox.get(selection[0])
-            self.chat_target_var.set(f"與 {user} 聊天")
-            self.current_chat_target = user
-            self.current_chat_type = 'user'
-            
-            # 顯示與該使用者的聊天記錄
-            self.display_chat_history(user)
+        self.chat_target_label.configure(text=f"與 {user} 聊天")
+        self.current_chat_target = user
+        self.current_chat_type = 'user'
+        
+        # 顯示與該使用者的聊天記錄
+        self.display_chat_history(user)
     
-    def on_group_select(self, event):
+    def on_group_select(self, group_id, group_name):
         """選擇群組事件"""
-        selection = self.group_listbox.curselection()
-        if selection:
-            group_item = self.group_listbox.get(selection[0])
-            # 從顯示文字中提取 group_id
-            if ' (ID: ' in group_item:
-                group_id = group_item.split(' (ID: ')[1].rstrip(')')
-                group_name = group_item.split(' (ID: ')[0]
-            else:
-                # 舊格式相容
-                group_id = group_item
-                group_name = self.client.groups.get(group_id, {}).get('name', group_id)
+        if group_id in self.client.groups:
+            members = self.client.groups[group_id]['members']
+            self.group_info_label.configure(text=f"群組: {group_name}")
+            self.group_members_label.configure(text=f"成員: {', '.join(members)}")
+            self.current_group_id = group_id
+            self.current_group_name = group_name
             
-            if group_id in self.client.groups:
-                members = self.client.groups[group_id]['members']
-                self.group_info_var.set(f"群組: {group_name}")
-                self.group_members_var.set(f"成員: {', '.join(members)}")
-                self.current_group_id = group_id
-                self.current_group_name = group_name
-                
-                # 顯示群組聊天記錄
-                self.display_group_chat_history(group_id)
+            # 顯示群組聊天記錄
+            self.display_group_chat_history(group_id)
     
     # ===== 顯示相關方法 =====
     
     def display_chat_history(self, user_id):
         """顯示與特定使用者的聊天記錄"""
-        self.chat_display.config(state='normal')
-        self.chat_display.delete(1.0, tk.END)
+        self.chat_display.configure(state="normal")
+        self.chat_display.delete("1.0", "end")
         
         if user_id in self.chat_history:
             for msg in self.chat_history[user_id]:
                 self.display_message_in_chat(msg['sender'], msg['content'], msg['timestamp'], msg['is_me'])
         
-        self.chat_display.config(state='disabled')
-        self.chat_display.see(tk.END)
+        self.chat_display.configure(state="disabled")
+        self.chat_display.see("end")
     
     def display_group_chat_history(self, group_id):
         """顯示群組聊天記錄"""
-        self.group_chat_display.config(state='normal')
-        self.group_chat_display.delete(1.0, tk.END)
+        self.group_chat_display.configure(state="normal")
+        self.group_chat_display.delete("1.0", "end")
         
         if group_id in self.group_chat_history:
             for msg in self.group_chat_history[group_id]:
                 self.display_message_in_group_chat(msg['sender'], msg['content'], msg['timestamp'], msg['is_me'])
         
-        self.group_chat_display.config(state='disabled')
-        self.group_chat_display.see(tk.END)
+        self.group_chat_display.configure(state="disabled")
+        self.group_chat_display.see("end")
     
     def display_message_in_chat(self, sender, content, timestamp, is_me):
         """在聊天視窗顯示訊息"""
-        self.chat_display.insert(tk.END, f"[{timestamp}] ", 'timestamp')
-        if is_me:
-            self.chat_display.insert(tk.END, f"我: {content}\n", 'my_message')
-        else:
-            self.chat_display.insert(tk.END, f"{sender}: {content}\n", 'other_message')
+        color = "blue" if is_me else "green"
+        sender_text = "我" if is_me else sender
+        self.chat_display.insert("end", f"[{timestamp}] {sender_text}: {content}\n")
     
     def display_message_in_group_chat(self, sender, content, timestamp, is_me):
         """在群組聊天視窗顯示訊息"""
-        self.group_chat_display.insert(tk.END, f"[{timestamp}] ", 'timestamp')
-        if is_me:
-            self.group_chat_display.insert(tk.END, f"我: {content}\n", 'my_message')
-        else:
-            self.group_chat_display.insert(tk.END, f"{sender}: {content}\n", 'other_message')
+        color = "blue" if is_me else "green"
+        sender_text = "我" if is_me else sender
+        self.group_chat_display.insert("end", f"[{timestamp}] {sender_text}: {content}\n")
     
     # ===== 訊息發送方法 =====
     
@@ -508,7 +652,7 @@ class CSEClientGUI:
             messagebox.showwarning("警告", "請先選擇聊天對象")
             return
         
-        message = self.message_var.get()
+        message = self.message_entry.get()
         if not message:
             return
         
@@ -526,13 +670,13 @@ class CSEClientGUI:
         })
         
         # 顯示發送的訊息
-        self.chat_display.config(state='normal')
+        self.chat_display.configure(state="normal")
         self.display_message_in_chat(self.client_id, message, timestamp, True)
-        self.chat_display.config(state='disabled')
-        self.chat_display.see(tk.END)
+        self.chat_display.configure(state="disabled")
+        self.chat_display.see("end")
         
         # 清空輸入框
-        self.message_var.set("")
+        self.message_entry.delete(0, "end")
         
         # 在背景發送
         threading.Thread(
@@ -551,7 +695,7 @@ class CSEClientGUI:
             messagebox.showwarning("警告", "請先選擇群組")
             return
         
-        message = self.group_message_var.get()
+        message = self.group_message_entry.get()
         if not message:
             return
         
@@ -569,13 +713,13 @@ class CSEClientGUI:
         })
         
         # 顯示發送的訊息
-        self.group_chat_display.config(state='normal')
+        self.group_chat_display.configure(state="normal")
         self.display_message_in_group_chat(self.client_id, message, timestamp, True)
-        self.group_chat_display.config(state='disabled')
-        self.group_chat_display.see(tk.END)
+        self.group_chat_display.configure(state="disabled")
+        self.group_chat_display.see("end")
         
         # 清空輸入框
-        self.group_message_var.set("")
+        self.group_message_entry.delete(0, "end")
         
         # 在背景發送
         threading.Thread(
@@ -606,52 +750,87 @@ class CSEClientGUI:
             messagebox.showwarning("警告", "沒有其他在線用戶，無法創建群組")
             return
             
-        dialog = tk.Toplevel(self.root)
+        # 創建對話框視窗
+        dialog = ctk.CTkToplevel(self.root)
         dialog.title("創建群組")
-        dialog.geometry("400x350")
+        dialog.geometry("500x500")
         dialog.transient(self.root)
+        dialog.update_idletasks() 
         dialog.grab_set()
         
+        # 中心化視窗
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (500 // 2)
+        y = (dialog.winfo_screenheight() // 2) - (400 // 2)
+        dialog.geometry(f"500x500+{x}+{y}")
+        
+        # 主框架
+        main_frame = ctk.CTkFrame(dialog)
+        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+        
         # 群組名稱
-        ttk.Label(dialog, text="群組名稱:").grid(row=0, column=0, padx=10, pady=10, sticky=tk.W)
-        group_name_var = tk.StringVar()
-        name_entry = ttk.Entry(dialog, textvariable=group_name_var, width=30)
-        name_entry.grid(row=0, column=1, padx=10, pady=10)
-        name_entry.focus()
+        ctk.CTkLabel(
+            main_frame,
+            text="群組名稱:",
+            font=ctk.CTkFont(size=14)
+        ).pack(anchor="w", pady=(0, 5))
+        
+        group_name_entry = ctk.CTkEntry(
+            main_frame,
+            placeholder_text="輸入群組名稱",
+            width=300
+        )
+        group_name_entry.pack(fill="x", pady=(0, 20))
+        group_name_entry.focus()
         
         # 成員選擇
-        ttk.Label(dialog, text="選擇成員:").grid(row=1, column=0, padx=10, pady=5, sticky=tk.NW)
+        ctk.CTkLabel(
+            main_frame,
+            text="選擇成員:",
+            font=ctk.CTkFont(size=14)
+        ).pack(anchor="w", pady=(0, 5))
         
-        member_frame = ttk.Frame(dialog)
-        member_frame.grid(row=1, column=1, padx=10, pady=5, sticky=tk.NSEW)
+        # 成員列表容器
+        member_scroll = ctk.CTkScrollableFrame(main_frame, height=200)
+        member_scroll.pack(fill="both", expand=True, pady=(0, 10))
         
-        scrollbar = ttk.Scrollbar(member_frame)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        # 使用字典儲存checkbox變數
+        member_vars = {}
         
-        member_listbox = tk.Listbox(member_frame, selectmode=tk.MULTIPLE, height=10, yscrollcommand=scrollbar.set)
-        member_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.config(command=member_listbox.yview)
-        
-        # 填充在線使用者
         for user in online_clients:
             if user != self.client_id:
-                member_listbox.insert(tk.END, user)
+                var = ctk.BooleanVar()
+                member_vars[user] = var
+                
+                checkbox = ctk.CTkCheckBox(
+                    member_scroll,
+                    text=user,
+                    variable=var,
+                    font=ctk.CTkFont(size=12)
+                )
+                checkbox.pack(anchor="w", pady=2)
         
         # 提示文字
-        ttk.Label(dialog, text="(您會自動加入群組)", font=('Arial', 9), foreground='gray').grid(row=2, column=1, pady=5)
+        ctk.CTkLabel(
+            main_frame,
+            text="(您會自動加入群組)",
+            font=ctk.CTkFont(size=11),
+            text_color="gray"
+        ).pack(pady=5)
         
         def create_group():
-            group_name = group_name_var.get().strip()
+            group_name = group_name_entry.get().strip()
             if not group_name:
                 messagebox.showerror("錯誤", "請輸入群組名稱", parent=dialog)
                 return
             
-            selected_indices = member_listbox.curselection()
-            if not selected_indices:
+            # 獲取選中的成員
+            selected_members = [user for user, var in member_vars.items() if var.get()]
+            
+            if not selected_members:
                 messagebox.showerror("錯誤", "請至少選擇一個成員", parent=dialog)
                 return
-                
-            selected_members = [member_listbox.get(i) for i in selected_indices]
+            
             selected_members.append(self.client_id)  # 加入自己
             
             # 在背景創建群組
@@ -663,16 +842,25 @@ class CSEClientGUI:
             
             dialog.destroy()
         
-        # 按鈕
-        btn_frame = ttk.Frame(dialog)
-        btn_frame.grid(row=3, column=0, columnspan=2, pady=20)
+        # 按鈕框架
+        btn_frame = ctk.CTkFrame(main_frame)
+        btn_frame.pack(side="bottom", fill="x", pady=(10, 0))
         
-        ttk.Button(btn_frame, text="創建", command=create_group).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="取消", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+        ctk.CTkButton(
+            btn_frame,
+            text="創建",
+            command=create_group,
+            width=100
+        ).pack(side="left", padx=(0, 10))
         
-        # 設定對話框大小調整
-        dialog.grid_rowconfigure(1, weight=1)
-        dialog.grid_columnconfigure(1, weight=1)
+        ctk.CTkButton(
+            btn_frame,
+            text="取消",
+            command=dialog.destroy,
+            width=100,
+            fg_color="gray",
+            hover_color="darkgray"
+        ).pack(side="left")
     
     def _create_group_thread(self, group_name, members):
         """創建群組線程"""
@@ -682,6 +870,57 @@ class CSEClientGUI:
         except Exception as e:
             print(f"Create group error: {e}")
             self.message_queue.put(('create_group_result', (False, str(e), group_name)))
+    
+    # ===== UI 更新方法 =====
+    
+    def clear_online_users(self):
+        """清空在線使用者列表"""
+        for button in self.online_user_buttons.values():
+            button.destroy()
+        self.online_user_buttons.clear()
+    
+    def update_online_users(self, users):
+        """更新在線使用者列表"""
+        # 清除現有按鈕
+        self.clear_online_users()
+        
+        # 創建新按鈕
+        for user in users:
+            if user != self.client_id:
+                btn = ctk.CTkButton(
+                    self.online_users_frame,
+                    text=user,
+                    command=lambda u=user: self.on_user_select(u),
+                    height=35,
+                    fg_color=("gray75", "gray25"),
+                    hover_color=("gray60", "gray35")
+                )
+                btn.pack(fill="x", padx=5, pady=2)
+                self.online_user_buttons[user] = btn
+    
+    def clear_groups(self):
+        """清空群組列表"""
+        for button in self.group_buttons.values():
+            button.destroy()
+        self.group_buttons.clear()
+    
+    def update_groups(self, groups):
+        """更新群組列表"""
+        # 清除現有按鈕
+        self.clear_groups()
+        
+        # 創建新按鈕
+        for group_id, group_info in groups.items():
+            btn = ctk.CTkButton(
+                self.group_list_frame,
+                text=f"{group_info['name']}",
+                command=lambda gid=group_id, gname=group_info['name']: self.on_group_select(gid, gname),
+                height=35,
+                fg_color=("gray75", "gray25"),
+                hover_color=("gray60", "gray35")
+            )
+            btn.pack(fill="x", padx=5, pady=2)
+            self.group_buttons[group_id] = btn
     
     # ===== 回調處理方法 =====
     
@@ -722,20 +961,19 @@ class CSEClientGUI:
                 
                 if msg_type == 'service_discovered':
                     if data:
-                        self.service_status_text.insert(tk.END, "✓ 服務發現成功！\n")
-                        self.service_status_text.insert(tk.END, f"Server: {self.client.get_service_address('server')}\n")
-                        self.service_status_text.insert(tk.END, f"IdP: {self.client.get_service_address('idp')}\n")
-                        self.service_status_text.insert(tk.END, f"KACLS: {self.client.get_service_address('kacls')}\n")
-                        self.register_btn.config(state='normal')
-                        self.login_btn.config(state='normal')
-                        self.password_entry.config(state='normal')
-                        self.status_var.set("服務已連線")
-                        # 將焦點移到密碼欄位
+                        self.service_status_text.insert("end", "✓ 服務發現成功！\n")
+                        self.service_status_text.insert("end", f"Server: {self.client.get_service_address('server')}\n")
+                        self.service_status_text.insert("end", f"IdP: {self.client.get_service_address('idp')}\n")
+                        self.service_status_text.insert("end", f"KACLS: {self.client.get_service_address('kacls')}\n")
+                        self.register_btn.configure(state="normal")
+                        self.login_btn.configure(state="normal")
+                        self.password_entry.configure(state="normal")
+                        self.status_label.configure(text="服務已連線")
                         self.password_entry.focus()
                     else:
-                        self.service_status_text.insert(tk.END, "✗ 服務發現失敗\n")
+                        self.service_status_text.insert("end", "✗ 服務發現失敗\n")
                         messagebox.showerror("錯誤", "服務發現失敗，請檢查通關密語")
-                    self.discover_btn.config(state='normal')
+                    self.discover_btn.configure(state="normal")
                 
                 elif msg_type == 'register_result':
                     if data:
@@ -744,61 +982,32 @@ class CSEClientGUI:
                         messagebox.showerror("錯誤", "註冊失敗")
                 
                 elif msg_type == 'auth_status':
-                    # 顯示認證狀態
-                    self.auth_status_label.config(text=data)
+                    self.auth_status_label.configure(text=data)
                 
                 elif msg_type == 'login_result':
                     if data:
-                        self.notebook.tab(1, state='normal')
-                        self.notebook.tab(2, state='normal')
-                        self.register_btn.config(state='disabled')
-                        self.login_btn.config(state='disabled')
-                        self.logout_btn.config(state='normal')
-                        self.status_var.set(f"已登入 - {self.client_id}")
-                        self.auth_status_label.config(text="")
+                        self.enable_tabs()
+                        self.register_btn.configure(state="disabled")
+                        self.login_btn.configure(state="disabled")
+                        self.logout_btn.configure(state="normal")
+                        self.status_label.configure(text=f"已登入 - {self.client_id}")
+                        self.auth_status_label.configure(text="")
                         messagebox.showinfo("成功", "登入成功！")
+                        
+                        # 切換到聊天分頁
+                        self.tabview.set("聊天")
                         
                         # 啟動自動更新
                         self._start_auto_refresh()
                     else:
-                        self.auth_status_label.config(text="")
+                        self.auth_status_label.configure(text="")
                         messagebox.showerror("錯誤", "登入失敗")
                 
                 elif msg_type == 'online_users':
-                    # 更新在線使用者列表
-                    current_selection = None
-                    if self.online_listbox.curselection():
-                        current_selection = self.online_listbox.get(self.online_listbox.curselection()[0])
-                    
-                    self.online_listbox.delete(0, tk.END)
-                    for user in data:
-                        if user != self.client_id:
-                            self.online_listbox.insert(tk.END, user)
-                    
-                    # 恢復選擇
-                    if current_selection:
-                        for i in range(self.online_listbox.size()):
-                            if self.online_listbox.get(i) == current_selection:
-                                self.online_listbox.selection_set(i)
-                                break
+                    self.update_online_users(data)
                 
                 elif msg_type == 'groups_refreshed':
-                    # 更新群組列表
-                    current_selection = None
-                    if self.group_listbox.curselection():
-                        current_selection = self.group_listbox.get(self.group_listbox.curselection()[0])
-                    
-                    self.group_listbox.delete(0, tk.END)
-                    for group_id, group_info in data.items():
-                        display_text = f"{group_info['name']} (ID: {group_id})"
-                        self.group_listbox.insert(tk.END, display_text)
-                    
-                    # 恢復選擇
-                    if current_selection:
-                        for i in range(self.group_listbox.size()):
-                            if self.group_listbox.get(i) == current_selection:
-                                self.group_listbox.selection_set(i)
-                                break
+                    self.update_groups(data)
                 
                 elif msg_type == 'send_result':
                     success, is_group = data
@@ -809,13 +1018,11 @@ class CSEClientGUI:
                     success, result, group_name = data
                     if success:
                         messagebox.showinfo("成功", f"群組 '{group_name}' 創建成功！")
-                        # 刷新群組列表
                         self._refresh_groups()
                     else:
                         messagebox.showerror("錯誤", f"創建群組失敗: {result}")
                 
                 elif msg_type == 'new_message':
-                    # 收到新訊息
                     sender, content, timestamp, is_group, group_info = data
                     
                     if is_group:
@@ -835,10 +1042,10 @@ class CSEClientGUI:
                         
                         # 如果當前正在查看這個群組，即時顯示
                         if hasattr(self, 'current_group_id') and self.current_group_id == group_id:
-                            self.group_chat_display.config(state='normal')
+                            self.group_chat_display.configure(state="normal")
                             self.display_message_in_group_chat(sender, content, timestamp, False)
-                            self.group_chat_display.config(state='disabled')
-                            self.group_chat_display.see(tk.END)
+                            self.group_chat_display.configure(state="disabled")
+                            self.group_chat_display.see("end")
                         
                         # 顯示通知
                         self.show_notification(f"群組 {group_name}", f"{sender}: {content}")
@@ -856,24 +1063,21 @@ class CSEClientGUI:
                         
                         # 如果當前正在與該使用者聊天，即時顯示
                         if hasattr(self, 'current_chat_target') and self.current_chat_target == sender:
-                            self.chat_display.config(state='normal')
+                            self.chat_display.configure(state="normal")
                             self.display_message_in_chat(sender, content, timestamp, False)
-                            self.chat_display.config(state='disabled')
-                            self.chat_display.see(tk.END)
+                            self.chat_display.configure(state="disabled")
+                            self.chat_display.see("end")
                         
                         # 顯示通知
                         self.show_notification(f"來自 {sender}", content)
                 
                 elif msg_type == 'group_invite':
-                    # 被加入群組的通知
                     group_id, group_name, invited_by = data
                     self.show_notification("群組邀請", f"{invited_by} 將您加入群組 '{group_name}'")
-                    # 刷新群組列表
                     self._refresh_groups()
                 
                 elif msg_type == 'status_update':
-                    # 狀態更新
-                    self.status_var.set(data)
+                    self.status_label.configure(text=data)
                 
         except queue.Empty:
             pass
@@ -886,20 +1090,41 @@ class CSEClientGUI:
         # 發出聲音
         self.root.bell()
         
+        # 更新新訊息指示器
+        self.new_msg_indicator.configure(text="● 新訊息")
+        
+        # 5秒後清除指示器
+        self.root.after(5000, lambda: self.new_msg_indicator.configure(text=""))
+        
         # 如果視窗不在前景，顯示系統通知
         if not self.root.focus_displayof():
             # 創建一個小的通知視窗
-            notification = tk.Toplevel(self.root)
+            notification = ctk.CTkToplevel(self.root)
             notification.title(title)
-            notification.geometry("300x100+{}+{}".format(
-                self.root.winfo_x() + 50,
-                self.root.winfo_y() + 50
-            ))
+            notification.geometry("350x120")
             notification.transient(self.root)
             
+            # 設定通知視窗位置（右下角）
+            notification.update_idletasks()
+            x = notification.winfo_screenwidth() - 370
+            y = notification.winfo_screenheight() - 170
+            notification.geometry(f"350x120+{x}+{y}")
+            
             # 通知內容
-            ttk.Label(notification, text=title, font=('Arial', 10, 'bold')).pack(pady=5)
-            ttk.Label(notification, text=message, wraplength=280).pack(pady=5)
+            notif_frame = ctk.CTkFrame(notification)
+            notif_frame.pack(fill="both", expand=True, padx=10, pady=10)
+            
+            ctk.CTkLabel(
+                notif_frame,
+                text=title,
+                font=ctk.CTkFont(size=14, weight="bold")
+            ).pack(pady=(0, 5))
+            
+            ctk.CTkLabel(
+                notif_frame,
+                text=message,
+                wraplength=320
+            ).pack()
             
             # 3秒後自動關閉
             notification.after(3000, notification.destroy)
@@ -923,7 +1148,7 @@ class CSEClientGUI:
             print(f"Refresh online users error: {e}")
         
         # 排程下次更新
-        self.refresh_timer = self.root.after(5000, self._refresh_online_users)  # 每5秒更新一次
+        self.refresh_timer = self.root.after(5000, self._refresh_online_users)
     
     def _refresh_groups(self):
         """刷新群組列表"""
@@ -937,7 +1162,7 @@ class CSEClientGUI:
             print(f"Refresh groups error: {e}")
         
         # 排程下次更新
-        self.root.after(10000, self._refresh_groups)  # 每10秒更新一次
+        self.root.after(10000, self._refresh_groups)
     
     def run(self):
         """啟動 GUI"""
@@ -945,7 +1170,7 @@ class CSEClientGUI:
 
 
 def main():
-    # 不再需要命令列參數
+    # 創建並執行 GUI
     gui = CSEClientGUI()
     gui.run()
 
