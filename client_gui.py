@@ -11,6 +11,8 @@ import queue
 import sys
 from datetime import datetime
 from client import CSEClient
+from PIL import Image
+from customtkinter import CTkImage
 
 # 設定外觀模式和主題
 ctk.set_appearance_mode("dark")  # 可選 "light", "dark", "system"
@@ -98,28 +100,42 @@ class CSEClientGUI:
         )
         self.new_msg_indicator.pack(side="right", padx=10)
     
+    
     def setup_connection_tab(self):
-        """設定連線分頁"""
-        # 創建滾動框架
-        self.connection_scroll = ctk.CTkScrollableFrame(self.connection_tab)
-        self.connection_scroll.pack(fill="both", expand=True, padx=20, pady=20)
-        
-        # 用戶登入區域
-        user_frame = ctk.CTkFrame(self.connection_scroll)
-        user_frame.pack(fill="x", pady=(0, 20))
-        
+        """設定連線分頁（上中下三層：上層放圖片、中層左右分別放用戶資訊與身份驗證、下層放服務發現，且發現按鈕右側顯示結果文字）"""
+
+        # 最外層容器
+        container = ctk.CTkFrame(self.connection_tab, fg_color="transparent")
+        container.pack(fill="both", expand=True, padx=20, pady=20)
+
+        # === 上層：放圖片 ===
+        top_frame = ctk.CTkFrame(container, fg_color="transparent")
+        top_frame.pack(fill="x", pady=(0, 10))
+
+        # 載入並顯示圖片（自行替換路徑與大小）
+        img_pil = Image.open("assets/Yakuza.jpg")
+        orig_w, orig_h = img_pil.size
+        self.top_image = CTkImage(dark_image=img_pil, size=(840, 350))
+        top_label = ctk.CTkLabel(top_frame, image=self.top_image, text="")
+        top_label.pack()
+
+        # === 中層：左右佈局 ─ 左側放用戶資訊，右側放身份驗證 ===
+        middle_frame = ctk.CTkFrame(container, fg_color="transparent")
+        middle_frame.pack(fill="x", pady=(0, 10))
+
+        # 左側：用戶資訊
+        user_frame = ctk.CTkFrame(middle_frame, fg_color="transparent")
+        user_frame.pack(side="left", fill="both", expand=True, padx=(0, 5))
+
         ctk.CTkLabel(
-            user_frame, 
-            text="用戶資訊", 
+            user_frame,
+            text="用戶資訊",
             font=ctk.CTkFont(size=16, weight="bold")
         ).pack(pady=(10, 5))
-        
-        # 用戶名稱輸入
-        username_container = ctk.CTkFrame(user_frame)
+
+        username_container = ctk.CTkFrame(user_frame, fg_color="transparent")
         username_container.pack(fill="x", padx=20, pady=10)
-        
         ctk.CTkLabel(username_container, text="用戶名稱:").pack(side="left", padx=(0, 10))
-        
         self.username_entry = ctk.CTkEntry(
             username_container,
             placeholder_text="請輸入用戶名稱",
@@ -127,7 +143,6 @@ class CSEClientGUI:
         )
         self.username_entry.pack(side="left", padx=(0, 10))
         self.username_entry.focus()
-        
         self.set_username_btn = ctk.CTkButton(
             username_container,
             text="設定用戶名稱",
@@ -135,8 +150,7 @@ class CSEClientGUI:
             width=120
         )
         self.set_username_btn.pack(side="left")
-        
-        # 顯示當前用戶
+
         self.current_user_label = ctk.CTkLabel(
             user_frame,
             text="",
@@ -144,65 +158,20 @@ class CSEClientGUI:
             text_color=("blue", "lightblue")
         )
         self.current_user_label.pack(pady=(5, 10))
-        
-        # 服務發現區域
-        self.discovery_frame = ctk.CTkFrame(self.connection_scroll)
-        self.discovery_frame.pack(fill="x", pady=(0, 20))
-        
-        ctk.CTkLabel(
-            self.discovery_frame,
-            text="服務發現",
-            font=ctk.CTkFont(size=16, weight="bold")
-        ).pack(pady=(10, 5))
-        
-        # 通關密語輸入
-        passphrase_container = ctk.CTkFrame(self.discovery_frame)
-        passphrase_container.pack(fill="x", padx=20, pady=10)
-        
-        ctk.CTkLabel(passphrase_container, text="通關密語:").pack(side="left", padx=(0, 10))
-        
-        self.passphrase_entry = ctk.CTkEntry(
-            passphrase_container,
-            placeholder_text="請輸入通關密語",
-            show="*",
-            width=200,
-            state="disabled"
-        )
-        self.passphrase_entry.pack(side="left", padx=(0, 10))
-        
-        self.discover_btn = ctk.CTkButton(
-            passphrase_container,
-            text="發現服務",
-            command=self.discover_services_async,
-            width=120,
-            state="disabled"
-        )
-        self.discover_btn.pack(side="left")
-        
-        # 服務狀態顯示
-        self.service_status_text = ctk.CTkTextbox(
-            self.discovery_frame,
-            height=100,
-            state="disabled"
-        )
-        self.service_status_text.pack(fill="x", padx=20, pady=(0, 10))
-        
-        # 身份驗證區域
-        self.auth_frame = ctk.CTkFrame(self.connection_scroll)
-        self.auth_frame.pack(fill="x")
-        
+
+        # 右側：身份驗證
+        self.auth_frame = ctk.CTkFrame(middle_frame, fg_color="transparent")
+        self.auth_frame.pack(side="right", fill="both", expand=True, padx=(5, 0))
+
         ctk.CTkLabel(
             self.auth_frame,
             text="身份驗證",
             font=ctk.CTkFont(size=16, weight="bold")
         ).pack(pady=(10, 5))
-        
-        # 密碼輸入
-        password_container = ctk.CTkFrame(self.auth_frame)
+
+        password_container = ctk.CTkFrame(self.auth_frame, fg_color="transparent")
         password_container.pack(fill="x", padx=20, pady=10)
-        
         ctk.CTkLabel(password_container, text="密碼:").pack(side="left", padx=(0, 10))
-        
         self.password_entry = ctk.CTkEntry(
             password_container,
             placeholder_text="請輸入密碼",
@@ -211,11 +180,9 @@ class CSEClientGUI:
             state="disabled"
         )
         self.password_entry.pack(side="left", padx=(0, 10))
-        
-        # 按鈕區域
-        button_container = ctk.CTkFrame(self.auth_frame)
+
+        button_container = ctk.CTkFrame(self.auth_frame, fg_color="transparent")
         button_container.pack(pady=10)
-        
         self.register_btn = ctk.CTkButton(
             button_container,
             text="註冊",
@@ -224,7 +191,6 @@ class CSEClientGUI:
             state="disabled"
         )
         self.register_btn.pack(side="left", padx=5)
-        
         self.login_btn = ctk.CTkButton(
             button_container,
             text="登入",
@@ -233,7 +199,6 @@ class CSEClientGUI:
             state="disabled"
         )
         self.login_btn.pack(side="left", padx=5)
-        
         self.logout_btn = ctk.CTkButton(
             button_container,
             text="登出",
@@ -244,20 +209,66 @@ class CSEClientGUI:
             hover_color="darkred"
         )
         self.logout_btn.pack(side="left", padx=5)
-        
-        # 認證狀態顯示
+
         self.auth_status_label = ctk.CTkLabel(
             self.auth_frame,
             text="",
             text_color=("blue", "lightblue")
         )
         self.auth_status_label.pack(pady=(5, 10))
-        
-        # 設定Enter鍵綁定
+
+        # 綁定 Enter 鍵
         self.username_entry.bind('<Return>', lambda e: self.set_username())
-        self.passphrase_entry.bind('<Return>', lambda e: self.discover_services_async())
         self.password_entry.bind('<Return>', lambda e: self.login_async())
-    
+
+        # === 下層：服務發現 ===
+        self.discovery_frame = ctk.CTkFrame(container, fg_color="transparent")
+        self.discovery_frame.pack(fill="x", pady=(0, 10))
+
+        ctk.CTkLabel(
+            self.discovery_frame,
+            text="服務發現",
+            font=ctk.CTkFont(size=16, weight="bold")
+        ).grid(row=0, column=0, sticky="w", padx=200, pady=(10, 5))
+
+        # 通關密語輸入與按鈕（放在 grid row=1, column=0）
+        passphrase_container = ctk.CTkFrame(self.discovery_frame, fg_color="transparent")
+        passphrase_container.grid(row=1, column=0, sticky="w", padx=(20, 10), pady=10)
+        ctk.CTkLabel(passphrase_container, text="通關密語:").pack(side="left", padx=(0, 10))
+        self.passphrase_entry = ctk.CTkEntry(
+            passphrase_container,
+            placeholder_text="請輸入通關密語",
+            show="*",
+            width=200,
+            state="disabled"
+        )
+        self.passphrase_entry.pack(side="left", padx=(0, 10))
+        self.discover_btn = ctk.CTkButton(
+            passphrase_container,
+            text="發現服務",
+            command=self.discover_services_async,
+            width=120,
+            state="disabled"
+        )
+        self.discover_btn.pack(side="left")
+
+        # 服務狀態文字框放在按鈕右邊（grid row=1, column=1）
+        self.service_status_text = ctk.CTkTextbox(
+            self.discovery_frame,
+            height=100,
+            state="disabled",
+            fg_color="transparent",
+            border_width=0
+        )
+        self.service_status_text.grid(row=1, column=1, sticky="nsew", padx=(10, 20), pady=10)
+
+        # 讓 column=1 可拉伸
+        self.discovery_frame.grid_columnconfigure(1, weight=1)
+
+        # 綁定 Enter
+        self.passphrase_entry.bind('<Return>', lambda e: self.discover_services_async())
+
+
     def setup_chat_tab(self):
         """設定聊天分頁"""
         # 主要容器
