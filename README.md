@@ -1,42 +1,37 @@
-# CSE Communication System (Client‑Side Encryption)
+# Brotherhood Communiaction 兄弟會通訊軟體
 
 > **Secure, self‑hosted messaging & group chat with end‑to‑end encryption — written in Python 3.12**
 
+
+---
+## 本專案是模仿Google Client Side Encryption(CSE)打造的內網通訊軟體，要求至少3台主機組成服務維護通訊安全。
 ---
 
 ## 🗂️ 專案架構
 
 ```
-├── server.py          # 服務協調與訊息轉送 (Server)
-├── idp.py             # 用戶身分與 3P_JWT 簽發 (Identity Provider)
+├── server.py          # 服務協調,訊息轉送及簽發B_JWT
+├── idp.py             # 用戶身分驗證與 3P_JWT 簽發
 ├── kacls.py           # DEK/KEK 包裝與授權 (Key Access Control)
-├── client.py          # 客戶端後端邏輯 (加解密 / 網路)
-├── client_gui.py      # CustomTkinter 圖形介面 (Frontend)
+├── client.py          # client後端
+├── client_gui.py      # client前端(採CustomTkinter 圖形介面)
 ├── common_utils.py    # 加密 / JWT / 網路共用函式
-├── requirements.txt   # Python 依賴版本鎖定
-└── README.md          # 你正在看的檔案
+├── requirements.txt   # Python 依賴的library(含版本)
+└── assets             # 放圖形介面的配圖           
 ```
 
-各元件以 **UDP 廣播 + RSA/AES 加密通訊** 自動發現並交換公鑰，透過下列協定合作：
 
-| 流程     | 端點                         | 重點技術                                 |
-| ------ | -------------------------- | ------------------------------------ |
-| 服務發現   | `server ↔ all`             | UDP Broadcast + AES‑GCM (passphrase) |
-| 用戶註冊   | `client → idp`             | PBKDF2 密碼雜湊 + RSA Challenge          |
-| 用戶驗證   | `client ↔ idp`             | 3P\_JWT + RSA 簽名挑戰                   |
-| DEK 包裝 | `client → kacls`           | KEK 加密 & 受眾綁定                        |
-| 訊息傳遞   | `client → server → client` | AES‑GCM 封包 + B\_JWT                  |
 
 ---
 
-## 🚀 快速開始 (本機開發)
+## 🚀 快速開始 
 
 1. **下載原始碼**
 
    ```bash
-   git clone <repo-url> && cd ClientSideEncryption
+   git clone [<repo-url](https://github.com/duduLiu8787/CSE_BrotherhoodCommunication.git)> && cd CSE_BrotherhoodCommunication
    ```
-2. **建立並啟動虛擬環境**
+2. **建立並啟動虛擬環境(可選)**
 
    ```bash
    python -m venv venv && source venv/bin/activate  # Windows: venv\Scripts\activate
@@ -46,14 +41,14 @@
    ```bash
    pip install -r requirements.txt
    ```
-4. **啟動三大服務 (各開一個 Terminal) — passphrase 請自訂一致**
+4. **啟動三大服務 (各開一個 Terminal) — passphrase 請自訂通關密語例如"brother"**
 
    ```bash
    python server.py <passphrase>
    python idp.py    <passphrase>
    python kacls.py  <passphrase>
    ```
-5. **啟動客戶端 GUI**
+5. **啟動Client端**
 
    ```bash
    python client_gui.py
@@ -79,4 +74,4 @@
 
 ## 📜 授權
 
-Released under the MIT License — © 2025, DHL & Contributors
+Released under the MIT License — © 2025, DHL(duduLiu8787) & Contributors
